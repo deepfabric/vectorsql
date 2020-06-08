@@ -1,0 +1,4 @@
+#!/bin/bash
+
+rm sql.go sql.output
+goyacc -o sql.go -p sql -v sql.output sql.y

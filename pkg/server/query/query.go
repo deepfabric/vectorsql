@@ -2,19 +2,31 @@ package query
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
+	"time"
 
 	"github.com/deepfabric/vectorsql/pkg/logger"
+	"github.com/deepfabric/vectorsql/pkg/request"
 	"github.com/deepfabric/vectorsql/pkg/server"
+	"github.com/deepfabric/vectorsql/pkg/sql/build"
+	"github.com/deepfabric/vectorsql/pkg/sql/client"
+	"github.com/deepfabric/vectorsql/pkg/storage"
 	"github.com/deepfabric/vectorsql/pkg/vector"
+	"github.com/deepfabric/vectorsql/pkg/vm/bv"
+	"github.com/deepfabric/vectorsql/pkg/vm/context"
 	"github.com/valyala/fasthttp"
 )
 
-func New(port int, log logger.Log, vec vector.Vector) server.Server {
+func New(port, mcpu int, b bv.BV, log logger.Log, cli client.Client, vec vector.Vector, stg storage.Storage) server.Server {
 	return &query{
+		b:    b,
+		cli:  cli,
 		log:  log,
 		vec:  vec,
+		stg:  stg,
+		mcpu: mcpu,
 		port: port,
 	}
 }
@@ -41,7 +53,7 @@ func (q *query) dealQuery(ctx *fasthttp.RequestCtx) {
 	ctx.Response.SetStatusCode(200)
 	ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
 	ctx.Response.Header.Set("Content-Type", "application/json")
-	form, err := ctx.MultipartForm()
+	qr, vec, err := q.extractParameters(ctx)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		hr.Msg = err.Error()
@@ -49,36 +61,16 @@ func (q *query) dealQuery(ctx *fasthttp.RequestCtx) {
 		ctx.Write(data)
 		return
 	}
-	body := []byte{}
-	images := make(map[string][]byte)
-	for k, v := range form.File {
-		for _, h := range v {
-			fp, err := h.Open()
-			if err != nil {
-				ctx.Response.SetStatusCode(400)
-				hr.Msg = err.Error()
-				data, _ := json.Marshal(hr)
-				ctx.Write(data)
-				return
-			}
-			data, err := ioutil.ReadAll(fp)
-			if err != nil {
-				fp.Close()
-				ctx.Response.SetStatusCode(400)
-				hr.Msg = err.Error()
-				data, _ := json.Marshal(hr)
-				ctx.Write(data)
-				return
-			}
-			fp.Close()
-			body = append(body, data...)
-		}
-		if len(body) > 0 {
-			images[k] = body
-			body = []byte{}
-		}
+	start := time.Now()
+	o, err := build.New(qr, context.New(nil), q.stg).Build()
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		hr.Msg = err.Error()
+		data, _ := json.Marshal(hr)
+		ctx.Write(data)
+		return
 	}
-	v, err := q.vec.GetVector(images)
+	rows, err := o.Result(q.mcpu, q.b, q.cli, vec)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		hr.Msg = err.Error()
@@ -87,9 +79,75 @@ func (q *query) dealQuery(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	{
-		data, _ := json.Marshal(v)
+		data, _ := json.Marshal(rows)
+		hr.Sql = qr
 		hr.Msg = string(data)
+		hr.ProcessTime = fmt.Sprintf("%v", time.Now().Sub(start))
 	}
 	data, _ := json.Marshal(hr)
 	ctx.Write(data)
+}
+
+func (q *query) extractParameters(ctx *fasthttp.RequestCtx) (string, []float32, error) {
+	var typ string
+	var body []byte
+	var mp map[string]interface{}
+
+	form, err := ctx.MultipartForm()
+	if err != nil {
+		return "", nil, err
+	}
+	fs := make(map[string]*request.Part)
+	for k, v := range form.File {
+		for i, h := range v {
+			if i == 0 {
+				typ = h.Header.Get("Content-Type")
+			}
+			fp, err := h.Open()
+			if err != nil {
+				return "", nil, err
+			}
+			data, err := ioutil.ReadAll(fp)
+			if err != nil {
+				fp.Close()
+				return "", nil, err
+			}
+			fp.Close()
+			body = append(body, data...)
+		}
+		if len(body) > 0 {
+			if typ == "application/json" {
+				if err := json.Unmarshal(body, &mp); err != nil {
+					return "", nil, err
+				}
+			} else {
+				fs[k] = &request.Part{Typ: typ, Data: body}
+			}
+			body = []byte{}
+		}
+	}
+	qr, err := q.getSqlQuery(mp)
+	if err != nil {
+		return "", nil, err
+	}
+	vec, err := q.vec.GetVector(fs)
+	if err != nil {
+		return "", nil, err
+	}
+	return qr, vec, nil
+}
+
+func (q *query) getSqlQuery(mp map[string]interface{}) (string, error) {
+	return getString("query", mp)
+}
+
+func getString(k string, mp map[string]interface{}) (string, error) {
+	v, ok := mp[k]
+	if !ok {
+		return "", errors.New("Not Exist")
+	}
+	if _, ok := v.(string); !ok {
+		return "", errors.New("Not String")
+	}
+	return v.(string), nil
 }

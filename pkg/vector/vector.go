@@ -1,64 +1,35 @@
 package vector
 
 import (
-	"bytes"
 	"encoding/json"
-	"fmt"
-	"io"
 	"math"
-	"mime/multipart"
-	"net/http"
-	"net/textproto"
 	"strconv"
+
+	"github.com/deepfabric/vectorsql/pkg/request"
+	"github.com/valyala/fasthttp"
 )
 
 func New(url string) *vector {
 	return &vector{url}
 }
 
-func (v *vector) GetVector(images map[string][]byte) ([]float32, error) {
-	var body bytes.Buffer
+func (v *vector) GetVector(fs map[string]*request.Part) ([]float32, error) {
 	var mp map[string][]string
+	var resp fasthttp.Response
 
-	req, err := NewRequest(v.url, images)
-	if err != nil {
-		return nil, nil
-	}
-	cli := &http.Client{}
-	resp, err := cli.Do(req)
+	req, err := request.NewRequest(v.url, fs)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if _, err := body.ReadFrom(resp.Body); err != nil {
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(&resp)
+	if err := fasthttp.Do(req, &resp); err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(body.Bytes(), &mp); err != nil {
+	if err := json.Unmarshal(resp.Body(), &mp); err != nil {
 		return nil, err
 	}
 	return mean(mp), nil
-}
-
-func NewRequest(url string, images map[string][]byte) (*http.Request, error) {
-	var body bytes.Buffer
-
-	w := multipart.NewWriter(&body)
-	for k, v := range images {
-		h := make(textproto.MIMEHeader)
-		h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, k, k))
-		h.Set("Content-Type", "image/jpg")
-		p, _ := w.CreatePart(h)
-		io.Copy(p, bytes.NewReader(v))
-	}
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequest("POST", url, &body)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
-	return req, nil
 }
 
 func mean(mp map[string][]string) []float32 {

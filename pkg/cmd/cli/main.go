@@ -1,39 +1,40 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 
-	"github.com/deepfabric/vectorsql/pkg/vector"
+	"github.com/deepfabric/vectorsql/pkg/request"
+	"github.com/valyala/fasthttp"
 )
 
 func main() {
-	data, err := ioutil.ReadFile(os.Args[1])
-	if err != nil {
-		log.Fatal(err)
+	if len(os.Args[2]) < 3 {
+		fmt.Printf("Usage: cli query images[...]")
+		return
 	}
-	images := make(map[string][]byte)
-	images["a"] = data
-	req, err := vector.NewRequest("http://127.0.0.1:8888/query", images)
-	if err != nil {
-		log.Fatal(err)
-	}
-	cli := &http.Client{}
-	resp, err := cli.Do(req)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
-	{
-		var body bytes.Buffer
-
-		if _, err := body.ReadFrom(resp.Body); err != nil {
+	fs := make(map[string]*request.Part)
+	for i, j := 2, len(os.Args); i < j; i++ {
+		data, err := ioutil.ReadFile(os.Args[i])
+		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("body: %s\n", string(body.Bytes()))
+		fs[os.Args[i]] = &request.Part{"image/jepg", data}
 	}
+	{
+		fs["query"] = &request.Part{"application/json", []byte(fmt.Sprintf("{\"query\":\"%s\"}", os.Args[1]))}
+	}
+	req, err := request.NewRequest("http://127.0.0.1:8888/query", fs)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var resp fasthttp.Response
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(&resp)
+	if err := fasthttp.Do(req, &resp); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("body: %s\n", string(resp.Body()))
 }

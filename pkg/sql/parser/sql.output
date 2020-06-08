@@ -1,0 +1,3081 @@
+
+state 0
+	$accept: .stmt_block $end 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	stmt_block  goto 1
+	stmt  goto 2
+	select_stmt  goto 3
+	relation  goto 4
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 11
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 1
+	$accept:  stmt_block.$end 
+
+	$end  accept
+	.  error
+
+
+state 2
+	stmt_block:  stmt.    (1)
+
+	.  reduce 1 (src line 329)
+
+
+state 3
+	stmt:  select_stmt.    (2)
+
+	.  reduce 2 (src line 331)
+
+
+state 4
+	select_stmt:  relation.opt_order_clause opt_fetch_clause 
+	select_clause:  relation.    (110)
+	opt_order_clause: .    (5)
+
+	$end  reduce 5 (src line 345)
+	FTOP  shift 19
+	FETCH  reduce 5 (src line 345)
+	OFFSET  reduce 5 (src line 345)
+	ORDER  shift 17
+	TOP  shift 18
+	')'  reduce 5 (src line 345)
+	.  reduce 110 (src line 640)
+
+	order_clause  goto 16
+	opt_order_clause  goto 15
+
+state 5
+	relation:  table_name.opt_alias_clause 
+	opt_alias_clause: .    (108)
+
+	IDENT  shift 14
+	AS  shift 22
+	.  reduce 108 (src line 633)
+
+	name  goto 24
+	table_alias_name  goto 23
+	alias_clause  goto 21
+	opt_alias_clause  goto 20
+
+state 6
+	relation:  join_clause.    (32)
+
+	.  reduce 32 (src line 426)
+
+
+state 7
+	relation:  union_clause.    (33)
+
+	.  reduce 33 (src line 427)
+
+
+state 8
+	relation:  simple_select.    (34)
+
+	.  reduce 34 (src line 428)
+
+
+state 9
+	relation:  '('.select_stmt ')' opt_alias_clause 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	select_stmt  goto 25
+	relation  goto 4
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 11
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 10
+	table_name:  column_name.    (130)
+	column_name:  column_name.'.' name 
+	column_name:  column_name.'.' name '[' a_expr ']' 
+
+	'.'  shift 26
+	.  reduce 130 (src line 744)
+
+
+state 11
+	union_clause:  select_clause.UNION all_or_distinct select_clause 
+	union_clause:  select_clause.INTERSECT all_or_distinct select_clause 
+	union_clause:  select_clause.EXCEPT all_or_distinct select_clause 
+	join_clause:  select_clause.CROSS JOIN select_clause 
+	join_clause:  select_clause.join_type JOIN select_clause join_qual 
+	join_clause:  select_clause.JOIN select_clause join_qual 
+	join_clause:  select_clause.NATURAL JOIN select_clause 
+
+	CROSS  shift 30
+	EXCEPT  shift 29
+	FULL  shift 34
+	INNER  shift 37
+	INTERSECT  shift 28
+	JOIN  shift 32
+	NATURAL  shift 33
+	RIGHT  shift 36
+	UNION  shift 27
+	LEFT  shift 35
+	.  error
+
+	join_type  goto 31
+
+state 12
+	simple_select:  SELECT.target_list from_clause opt_where_clause group_clause having_clause 
+	simple_select:  SELECT.distinct_clause target_list from_clause opt_where_clause group_clause having_clause 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	DISTINCT  shift 41
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'*'  shift 43
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	distinct_clause  goto 39
+	target_list  goto 38
+	a_expr  goto 42
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	target_elem  goto 40
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 13
+	column_name:  name.    (131)
+	column_name:  name.'[' a_expr ']' 
+
+	'['  shift 65
+	.  reduce 131 (src line 751)
+
+
+state 14
+	name:  IDENT.    (139)
+
+	.  reduce 139 (src line 783)
+
+
+state 15
+	select_stmt:  relation opt_order_clause.opt_fetch_clause 
+	opt_fetch_clause: .    (16)
+
+	FETCH  shift 70
+	OFFSET  shift 71
+	.  reduce 16 (src line 374)
+
+	fetch_clause  goto 67
+	opt_fetch_clause  goto 66
+	limit_clause  goto 68
+	offset_clause  goto 69
+
+state 16
+	opt_order_clause:  order_clause.    (4)
+
+	.  reduce 4 (src line 344)
+
+
+state 17
+	order_clause:  ORDER.BY order_list 
+
+	BY  shift 72
+	.  error
+
+
+state 18
+	order_clause:  TOP.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 73
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 19
+	order_clause:  FTOP.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 74
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 20
+	relation:  table_name opt_alias_clause.    (31)
+
+	.  reduce 31 (src line 421)
+
+
+state 21
+	opt_alias_clause:  alias_clause.    (107)
+
+	.  reduce 107 (src line 632)
+
+
+state 22
+	alias_clause:  AS.table_alias_name opt_column_list 
+
+	IDENT  shift 14
+	.  error
+
+	name  goto 24
+	table_alias_name  goto 75
+
+state 23
+	alias_clause:  table_alias_name.opt_column_list 
+	opt_column_list: .    (136)
+
+	'('  shift 77
+	.  reduce 136 (src line 770)
+
+	opt_column_list  goto 76
+
+state 24
+	table_alias_name:  name.    (142)
+
+	.  reduce 142 (src line 789)
+
+
+state 25
+	relation:  '(' select_stmt.')' opt_alias_clause 
+
+	')'  shift 78
+	.  error
+
+
+state 26
+	column_name:  column_name '.'.name 
+	column_name:  column_name '.'.name '[' a_expr ']' 
+
+	IDENT  shift 14
+	.  error
+
+	name  goto 79
+
+state 27
+	union_clause:  select_clause UNION.all_or_distinct select_clause 
+	all_or_distinct: .    (116)
+
+	ALL  shift 81
+	DISTINCT  shift 82
+	.  reduce 116 (src line 674)
+
+	all_or_distinct  goto 80
+
+state 28
+	union_clause:  select_clause INTERSECT.all_or_distinct select_clause 
+	all_or_distinct: .    (116)
+
+	ALL  shift 81
+	DISTINCT  shift 82
+	.  reduce 116 (src line 674)
+
+	all_or_distinct  goto 83
+
+state 29
+	union_clause:  select_clause EXCEPT.all_or_distinct select_clause 
+	all_or_distinct: .    (116)
+
+	ALL  shift 81
+	DISTINCT  shift 82
+	.  reduce 116 (src line 674)
+
+	all_or_distinct  goto 84
+
+state 30
+	join_clause:  select_clause CROSS.JOIN select_clause 
+
+	JOIN  shift 85
+	.  error
+
+
+state 31
+	join_clause:  select_clause join_type.JOIN select_clause join_qual 
+
+	JOIN  shift 86
+	.  error
+
+
+state 32
+	join_clause:  select_clause JOIN.select_clause join_qual 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	relation  goto 88
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 87
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 33
+	join_clause:  select_clause NATURAL.JOIN select_clause 
+
+	JOIN  shift 89
+	.  error
+
+
+state 34
+	join_type:  FULL.join_outer 
+	join_outer: .    (127)
+
+	OUTER  shift 91
+	.  reduce 127 (src line 723)
+
+	join_outer  goto 90
+
+state 35
+	join_type:  LEFT.join_outer 
+	join_outer: .    (127)
+
+	OUTER  shift 91
+	.  reduce 127 (src line 723)
+
+	join_outer  goto 92
+
+state 36
+	join_type:  RIGHT.join_outer 
+	join_outer: .    (127)
+
+	OUTER  shift 91
+	.  reduce 127 (src line 723)
+
+	join_outer  goto 93
+
+state 37
+	join_type:  INNER.    (125)
+
+	.  reduce 125 (src line 720)
+
+
+state 38
+	simple_select:  SELECT target_list.from_clause opt_where_clause group_clause having_clause 
+	target_list:  target_list.',' target_elem 
+	from_clause: .    (46)
+
+	FROM  shift 96
+	','  shift 95
+	.  reduce 46 (src line 505)
+
+	from_clause  goto 94
+
+state 39
+	simple_select:  SELECT distinct_clause.target_list from_clause opt_where_clause group_clause having_clause 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'*'  shift 43
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	target_list  goto 97
+	a_expr  goto 42
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	target_elem  goto 40
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 40
+	target_list:  target_elem.    (39)
+
+	.  reduce 39 (src line 465)
+
+
+state 41
+	distinct_clause:  DISTINCT.    (38)
+
+	.  reduce 38 (src line 461)
+
+
+state 42
+	target_elem:  a_expr.    (41)
+	target_elem:  a_expr.target_name 
+	target_elem:  a_expr.AS target_name 
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	IDENT  shift 14
+	AND  shift 101
+	AS  shift 99
+	IS  shift 102
+	OR  shift 100
+	.  reduce 41 (src line 482)
+
+	name  goto 103
+	target_name  goto 98
+
+state 43
+	target_elem:  '*'.    (44)
+
+	.  reduce 44 (src line 494)
+
+
+state 44
+	a_expr:  c_expr.    (58)
+
+	.  reduce 58 (src line 544)
+
+
+state 45
+	a_expr:  NOT.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 104
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 46
+	a_expr:  b_expr.    (64)
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr.'<' b_expr 
+	c_expr:  b_expr.'>' b_expr 
+	c_expr:  b_expr.'=' b_expr 
+	c_expr:  b_expr.LESS_EQUALS b_expr 
+	c_expr:  b_expr.GREATER_EQUALS b_expr 
+	c_expr:  b_expr.NOT_EQUALS b_expr 
+	c_expr:  b_expr.BETWEEN b_expr AND b_expr 
+	c_expr:  b_expr.NOT_LA BETWEEN b_expr AND b_expr 
+
+	LESS_EQUALS  shift 113
+	GREATER_EQUALS  shift 114
+	NOT_EQUALS  shift 115
+	BETWEEN  shift 116
+	NOT_LA  shift 117
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	'<'  shift 110
+	'>'  shift 111
+	'='  shift 112
+	.  reduce 64 (src line 550)
+
+
+state 47
+	c_expr:  EXISTS.subquery 
+
+	'('  shift 119
+	.  error
+
+	subquery  goto 118
+
+state 48
+	b_expr:  d_expr.    (65)
+
+	.  reduce 65 (src line 552)
+
+
+state 49
+	b_expr:  column_name.    (66)
+	column_name:  column_name.'.' name 
+	column_name:  column_name.'.' name '[' a_expr ']' 
+
+	'.'  shift 26
+	.  reduce 66 (src line 553)
+
+
+state 50
+	b_expr:  '+'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 120
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 51
+	b_expr:  '-'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 121
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 52
+	b_expr:  func_expr.    (74)
+
+	.  reduce 74 (src line 561)
+
+
+state 53
+	d_expr:  ICONST.    (84)
+
+	.  reduce 84 (src line 576)
+
+
+state 54
+	d_expr:  FCONST.    (85)
+
+	.  reduce 85 (src line 577)
+
+
+state 55
+	d_expr:  SCONST.    (86)
+
+	.  reduce 86 (src line 578)
+
+
+state 56
+	d_expr:  TRUE.    (87)
+
+	.  reduce 87 (src line 579)
+
+
+state 57
+	d_expr:  FALSE.    (88)
+
+	.  reduce 88 (src line 580)
+
+
+state 58
+	d_expr:  NULL.    (89)
+
+	.  reduce 89 (src line 581)
+
+
+state 59
+	d_expr:  '('.a_expr ')' 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 122
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 60
+	column_name:  name.    (131)
+	column_name:  name.'[' a_expr ']' 
+	func_name:  name.    (140)
+
+	'['  shift 65
+	'('  reduce 140 (src line 785)
+	.  reduce 131 (src line 751)
+
+
+state 61
+	func_expr:  func_application.    (94)
+
+	.  reduce 94 (src line 590)
+
+
+state 62
+	func_expr:  func_expr_common_subexpr.    (95)
+
+	.  reduce 95 (src line 594)
+
+
+state 63
+	func_application:  func_name.'(' ')' 
+	func_application:  func_name.'(' expr_list ')' 
+
+	'('  shift 123
+	.  error
+
+
+state 64
+	func_expr_common_subexpr:  CAST.'(' a_expr AS cast_target ')' 
+
+	'('  shift 124
+	.  error
+
+
+state 65
+	column_name:  name '['.a_expr ']' 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 125
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 66
+	select_stmt:  relation opt_order_clause opt_fetch_clause.    (3)
+
+	.  reduce 3 (src line 333)
+
+
+state 67
+	opt_fetch_clause:  fetch_clause.    (15)
+
+	.  reduce 15 (src line 373)
+
+
+state 68
+	fetch_clause:  limit_clause.offset_clause 
+	fetch_clause:  limit_clause.    (19)
+
+	OFFSET  shift 71
+	.  reduce 19 (src line 392)
+
+	offset_clause  goto 126
+
+state 69
+	fetch_clause:  offset_clause.limit_clause 
+	fetch_clause:  offset_clause.    (20)
+
+	FETCH  shift 70
+	.  reduce 20 (src line 396)
+
+	limit_clause  goto 127
+
+state 70
+	limit_clause:  FETCH.first_or_next opt_select_fetch_first_value row_or_rows ONLY 
+
+	FIRST  shift 129
+	NEXT  shift 130
+	.  error
+
+	first_or_next  goto 128
+
+state 71
+	offset_clause:  OFFSET.a_expr 
+	offset_clause:  OFFSET.d_expr row_or_rows 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 131
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 132
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 72
+	order_clause:  ORDER BY.order_list 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	order_list  goto 133
+	a_expr  goto 135
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	order  goto 134
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 73
+	order_clause:  TOP a_expr.    (7)
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	.  reduce 7 (src line 348)
+
+
+state 74
+	order_clause:  FTOP a_expr.    (8)
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	.  reduce 8 (src line 352)
+
+
+state 75
+	alias_clause:  AS table_alias_name.opt_column_list 
+	opt_column_list: .    (136)
+
+	'('  shift 77
+	.  reduce 136 (src line 770)
+
+	opt_column_list  goto 136
+
+state 76
+	alias_clause:  table_alias_name opt_column_list.    (106)
+
+	.  reduce 106 (src line 627)
+
+
+state 77
+	opt_column_list:  '('.name_list ')' 
+
+	IDENT  shift 14
+	.  error
+
+	name  goto 138
+	name_list  goto 137
+
+state 78
+	relation:  '(' select_stmt ')'.opt_alias_clause 
+	opt_alias_clause: .    (108)
+
+	IDENT  shift 14
+	AS  shift 22
+	.  reduce 108 (src line 633)
+
+	name  goto 24
+	table_alias_name  goto 23
+	alias_clause  goto 21
+	opt_alias_clause  goto 139
+
+state 79
+	column_name:  column_name '.' name.    (133)
+	column_name:  column_name '.' name.'[' a_expr ']' 
+
+	'['  shift 140
+	.  reduce 133 (src line 759)
+
+
+state 80
+	union_clause:  select_clause UNION all_or_distinct.select_clause 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	relation  goto 88
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 141
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 81
+	all_or_distinct:  ALL.    (114)
+
+	.  reduce 114 (src line 672)
+
+
+state 82
+	all_or_distinct:  DISTINCT.    (115)
+
+	.  reduce 115 (src line 673)
+
+
+state 83
+	union_clause:  select_clause INTERSECT all_or_distinct.select_clause 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	relation  goto 88
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 142
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 84
+	union_clause:  select_clause EXCEPT all_or_distinct.select_clause 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	relation  goto 88
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 143
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 85
+	join_clause:  select_clause CROSS JOIN.select_clause 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	relation  goto 88
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 144
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 86
+	join_clause:  select_clause join_type JOIN.select_clause join_qual 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	relation  goto 88
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 145
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 87
+	union_clause:  select_clause.UNION all_or_distinct select_clause 
+	union_clause:  select_clause.INTERSECT all_or_distinct select_clause 
+	union_clause:  select_clause.EXCEPT all_or_distinct select_clause 
+	join_clause:  select_clause.CROSS JOIN select_clause 
+	join_clause:  select_clause.join_type JOIN select_clause join_qual 
+	join_clause:  select_clause.JOIN select_clause join_qual 
+	join_clause:  select_clause JOIN select_clause.join_qual 
+	join_clause:  select_clause.NATURAL JOIN select_clause 
+
+	CROSS  shift 30
+	EXCEPT  shift 29
+	FULL  shift 34
+	INNER  shift 37
+	INTERSECT  shift 28
+	JOIN  shift 32
+	NATURAL  shift 33
+	ON  shift 147
+	RIGHT  shift 36
+	UNION  shift 27
+	LEFT  shift 35
+	.  error
+
+	join_qual  goto 146
+	join_type  goto 31
+
+state 88
+	select_clause:  relation.    (110)
+
+	.  reduce 110 (src line 640)
+
+
+state 89
+	join_clause:  select_clause NATURAL JOIN.select_clause 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	relation  goto 88
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 148
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 90
+	join_type:  FULL join_outer.    (122)
+
+	.  reduce 122 (src line 717)
+
+
+state 91
+	join_outer:  OUTER.    (126)
+
+	.  reduce 126 (src line 722)
+
+
+state 92
+	join_type:  LEFT join_outer.    (123)
+
+	.  reduce 123 (src line 718)
+
+
+state 93
+	join_type:  RIGHT join_outer.    (124)
+
+	.  reduce 124 (src line 719)
+
+
+state 94
+	simple_select:  SELECT target_list from_clause.opt_where_clause group_clause having_clause 
+	opt_where_clause: .    (50)
+
+	WHERE  shift 151
+	.  reduce 50 (src line 522)
+
+	where_clause  goto 150
+	opt_where_clause  goto 149
+
+state 95
+	target_list:  target_list ','.target_elem 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'*'  shift 43
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 42
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	target_elem  goto 152
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 96
+	from_clause:  FROM.from_list 
+
+	IDENT  shift 14
+	'('  shift 119
+	.  error
+
+	subquery  goto 156
+	name  goto 13
+	table_name  goto 155
+	column_name  goto 10
+	from_list  goto 153
+	table_ref  goto 154
+
+state 97
+	simple_select:  SELECT distinct_clause target_list.from_clause opt_where_clause group_clause having_clause 
+	target_list:  target_list.',' target_elem 
+	from_clause: .    (46)
+
+	FROM  shift 96
+	','  shift 95
+	.  reduce 46 (src line 505)
+
+	from_clause  goto 157
+
+state 98
+	target_elem:  a_expr target_name.    (42)
+
+	.  reduce 42 (src line 486)
+
+
+state 99
+	target_elem:  a_expr AS.target_name 
+
+	IDENT  shift 14
+	.  error
+
+	name  goto 103
+	target_name  goto 158
+
+state 100
+	a_expr:  a_expr OR.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 159
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 101
+	a_expr:  a_expr AND.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 160
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 102
+	a_expr:  a_expr IS.NULL 
+	a_expr:  a_expr IS.NOT NULL 
+
+	NOT  shift 162
+	NULL  shift 161
+	.  error
+
+
+state 103
+	target_name:  name.    (141)
+
+	.  reduce 141 (src line 787)
+
+
+state 104
+	a_expr:  NOT a_expr.    (59)
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	IS  shift 102
+	.  reduce 59 (src line 545)
+
+
+state 105
+	b_expr:  b_expr '+'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 163
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 106
+	b_expr:  b_expr '-'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 164
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 107
+	b_expr:  b_expr '*'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 165
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 108
+	b_expr:  b_expr '/'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 166
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 109
+	b_expr:  b_expr '%'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 167
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 110
+	c_expr:  b_expr '<'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 168
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 111
+	c_expr:  b_expr '>'.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 169
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 112
+	c_expr:  b_expr '='.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 170
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 113
+	c_expr:  b_expr LESS_EQUALS.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 171
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 114
+	c_expr:  b_expr GREATER_EQUALS.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 172
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 115
+	c_expr:  b_expr NOT_EQUALS.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 173
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 116
+	c_expr:  b_expr BETWEEN.b_expr AND b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 174
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 117
+	c_expr:  b_expr NOT_LA.BETWEEN b_expr AND b_expr 
+
+	BETWEEN  shift 175
+	.  error
+
+
+state 118
+	c_expr:  EXISTS subquery.    (83)
+
+	.  reduce 83 (src line 571)
+
+
+state 119
+	subquery:  '('.select_stmt ')' 
+
+	IDENT  shift 14
+	SELECT  shift 12
+	'('  shift 9
+	.  error
+
+	select_stmt  goto 176
+	relation  goto 4
+	join_clause  goto 6
+	union_clause  goto 7
+	select_clause  goto 11
+	simple_select  goto 8
+	name  goto 13
+	table_name  goto 5
+	column_name  goto 10
+
+state 120
+	b_expr:  '+' b_expr.    (67)
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 67 (src line 554)
+
+
+state 121
+	b_expr:  '-' b_expr.    (68)
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 68 (src line 555)
+
+
+state 122
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+	d_expr:  '(' a_expr.')' 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	')'  shift 177
+	.  error
+
+
+state 123
+	func_application:  func_name '('.')' 
+	func_application:  func_name '('.expr_list ')' 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	')'  shift 178
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	expr_list  goto 179
+	a_expr  goto 180
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 124
+	func_expr_common_subexpr:  CAST '('.a_expr AS cast_target ')' 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 181
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 125
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+	column_name:  name '[' a_expr.']' 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	']'  shift 182
+	.  error
+
+
+state 126
+	fetch_clause:  limit_clause offset_clause.    (17)
+
+	.  reduce 17 (src line 376)
+
+
+state 127
+	fetch_clause:  offset_clause limit_clause.    (18)
+
+	.  reduce 18 (src line 385)
+
+
+state 128
+	limit_clause:  FETCH first_or_next.opt_select_fetch_first_value row_or_rows ONLY 
+	opt_select_fetch_first_value: .    (26)
+
+	ICONST  shift 186
+	'+'  shift 187
+	'-'  shift 188
+	'('  shift 185
+	.  reduce 26 (src line 411)
+
+	opt_select_fetch_first_value  goto 183
+	signed_iconst  goto 184
+
+state 129
+	first_or_next:  FIRST.    (29)
+
+	.  reduce 29 (src line 416)
+
+
+state 130
+	first_or_next:  NEXT.    (30)
+
+	.  reduce 30 (src line 417)
+
+
+state 131
+	offset_clause:  OFFSET a_expr.    (22)
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	.  reduce 22 (src line 406)
+
+
+state 132
+	offset_clause:  OFFSET d_expr.row_or_rows 
+	b_expr:  d_expr.    (65)
+
+	ROW  shift 190
+	ROWS  shift 191
+	.  reduce 65 (src line 552)
+
+	row_or_rows  goto 189
+
+state 133
+	order_clause:  ORDER BY order_list.    (6)
+	order_list:  order_list.',' order 
+
+	','  shift 192
+	.  reduce 6 (src line 347)
+
+
+state 134
+	order_list:  order.    (9)
+
+	.  reduce 9 (src line 357)
+
+
+state 135
+	order:  a_expr.opt_asc_desc 
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+	opt_asc_desc: .    (14)
+
+	AND  shift 101
+	ASC  shift 194
+	DESC  shift 195
+	IS  shift 102
+	OR  shift 100
+	.  reduce 14 (src line 370)
+
+	opt_asc_desc  goto 193
+
+state 136
+	alias_clause:  AS table_alias_name opt_column_list.    (105)
+
+	.  reduce 105 (src line 623)
+
+
+state 137
+	opt_column_list:  '(' name_list.')' 
+	name_list:  name_list.',' name 
+
+	')'  shift 196
+	','  shift 197
+	.  error
+
+
+state 138
+	name_list:  name.    (137)
+
+	.  reduce 137 (src line 772)
+
+
+state 139
+	relation:  '(' select_stmt ')' opt_alias_clause.    (35)
+
+	.  reduce 35 (src line 429)
+
+
+state 140
+	column_name:  column_name '.' name '['.a_expr ']' 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 198
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 141
+	union_clause:  select_clause.UNION all_or_distinct select_clause 
+	union_clause:  select_clause UNION all_or_distinct select_clause.    (111)
+	union_clause:  select_clause.INTERSECT all_or_distinct select_clause 
+	union_clause:  select_clause.EXCEPT all_or_distinct select_clause 
+	join_clause:  select_clause.CROSS JOIN select_clause 
+	join_clause:  select_clause.join_type JOIN select_clause join_qual 
+	join_clause:  select_clause.JOIN select_clause join_qual 
+	join_clause:  select_clause.NATURAL JOIN select_clause 
+
+	CROSS  shift 30
+	FULL  shift 34
+	INNER  shift 37
+	INTERSECT  shift 28
+	JOIN  shift 32
+	NATURAL  shift 33
+	RIGHT  shift 36
+	LEFT  shift 35
+	.  reduce 111 (src line 644)
+
+	join_type  goto 31
+
+state 142
+	union_clause:  select_clause.UNION all_or_distinct select_clause 
+	union_clause:  select_clause.INTERSECT all_or_distinct select_clause 
+	union_clause:  select_clause INTERSECT all_or_distinct select_clause.    (112)
+	union_clause:  select_clause.EXCEPT all_or_distinct select_clause 
+	join_clause:  select_clause.CROSS JOIN select_clause 
+	join_clause:  select_clause.join_type JOIN select_clause join_qual 
+	join_clause:  select_clause.JOIN select_clause join_qual 
+	join_clause:  select_clause.NATURAL JOIN select_clause 
+
+	CROSS  shift 30
+	FULL  shift 34
+	INNER  shift 37
+	JOIN  shift 32
+	NATURAL  shift 33
+	RIGHT  shift 36
+	LEFT  shift 35
+	.  reduce 112 (src line 653)
+
+	join_type  goto 31
+
+state 143
+	union_clause:  select_clause.UNION all_or_distinct select_clause 
+	union_clause:  select_clause.INTERSECT all_or_distinct select_clause 
+	union_clause:  select_clause.EXCEPT all_or_distinct select_clause 
+	union_clause:  select_clause EXCEPT all_or_distinct select_clause.    (113)
+	join_clause:  select_clause.CROSS JOIN select_clause 
+	join_clause:  select_clause.join_type JOIN select_clause join_qual 
+	join_clause:  select_clause.JOIN select_clause join_qual 
+	join_clause:  select_clause.NATURAL JOIN select_clause 
+
+	CROSS  shift 30
+	FULL  shift 34
+	INNER  shift 37
+	INTERSECT  shift 28
+	JOIN  shift 32
+	NATURAL  shift 33
+	RIGHT  shift 36
+	LEFT  shift 35
+	.  reduce 113 (src line 662)
+
+	join_type  goto 31
+
+state 144
+	union_clause:  select_clause.UNION all_or_distinct select_clause 
+	union_clause:  select_clause.INTERSECT all_or_distinct select_clause 
+	union_clause:  select_clause.EXCEPT all_or_distinct select_clause 
+	join_clause:  select_clause.CROSS JOIN select_clause 
+	join_clause:  select_clause CROSS JOIN select_clause.    (117)
+	join_clause:  select_clause.join_type JOIN select_clause join_qual 
+	join_clause:  select_clause.JOIN select_clause join_qual 
+	join_clause:  select_clause.NATURAL JOIN select_clause 
+
+	.  reduce 117 (src line 678)
+
+	join_type  goto 31
+
+state 145
+	union_clause:  select_clause.UNION all_or_distinct select_clause 
+	union_clause:  select_clause.INTERSECT all_or_distinct select_clause 
+	union_clause:  select_clause.EXCEPT all_or_distinct select_clause 
+	join_clause:  select_clause.CROSS JOIN select_clause 
+	join_clause:  select_clause.join_type JOIN select_clause join_qual 
+	join_clause:  select_clause join_type JOIN select_clause.join_qual 
+	join_clause:  select_clause.JOIN select_clause join_qual 
+	join_clause:  select_clause.NATURAL JOIN select_clause 
+
+	CROSS  shift 30
+	EXCEPT  shift 29
+	FULL  shift 34
+	INNER  shift 37
+	INTERSECT  shift 28
+	JOIN  shift 32
+	NATURAL  shift 33
+	ON  shift 147
+	RIGHT  shift 36
+	UNION  shift 27
+	LEFT  shift 35
+	.  error
+
+	join_qual  goto 199
+	join_type  goto 31
+
+state 146
+	join_clause:  select_clause JOIN select_clause join_qual.    (119)
+
+	.  reduce 119 (src line 696)
+
+
+state 147
+	join_qual:  ON.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 200
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 148
+	union_clause:  select_clause.UNION all_or_distinct select_clause 
+	union_clause:  select_clause.INTERSECT all_or_distinct select_clause 
+	union_clause:  select_clause.EXCEPT all_or_distinct select_clause 
+	join_clause:  select_clause.CROSS JOIN select_clause 
+	join_clause:  select_clause.join_type JOIN select_clause join_qual 
+	join_clause:  select_clause.JOIN select_clause join_qual 
+	join_clause:  select_clause.NATURAL JOIN select_clause 
+	join_clause:  select_clause NATURAL JOIN select_clause.    (120)
+
+	.  reduce 120 (src line 705)
+
+	join_type  goto 31
+
+state 149
+	simple_select:  SELECT target_list from_clause opt_where_clause.group_clause having_clause 
+	group_clause: .    (53)
+
+	GROUP  shift 202
+	.  reduce 53 (src line 529)
+
+	group_clause  goto 201
+
+state 150
+	opt_where_clause:  where_clause.    (49)
+
+	.  reduce 49 (src line 518)
+
+
+state 151
+	where_clause:  WHERE.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 203
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 152
+	target_list:  target_list ',' target_elem.    (40)
+
+	.  reduce 40 (src line 473)
+
+
+state 153
+	from_clause:  FROM from_list.    (45)
+	from_list:  from_list.',' table_ref 
+
+	','  shift 204
+	.  reduce 45 (src line 501)
+
+
+state 154
+	from_list:  table_ref.    (47)
+
+	.  reduce 47 (src line 507)
+
+
+state 155
+	table_ref:  table_name.opt_alias_clause 
+	opt_alias_clause: .    (108)
+
+	IDENT  shift 14
+	AS  shift 22
+	.  reduce 108 (src line 633)
+
+	name  goto 24
+	table_alias_name  goto 23
+	alias_clause  goto 21
+	opt_alias_clause  goto 205
+
+state 156
+	table_ref:  subquery.opt_alias_clause 
+	opt_alias_clause: .    (108)
+
+	IDENT  shift 14
+	AS  shift 22
+	.  reduce 108 (src line 633)
+
+	name  goto 24
+	table_alias_name  goto 23
+	alias_clause  goto 21
+	opt_alias_clause  goto 206
+
+state 157
+	simple_select:  SELECT distinct_clause target_list from_clause.opt_where_clause group_clause having_clause 
+	opt_where_clause: .    (50)
+
+	WHERE  shift 151
+	.  reduce 50 (src line 522)
+
+	where_clause  goto 150
+	opt_where_clause  goto 207
+
+state 158
+	target_elem:  a_expr AS target_name.    (43)
+
+	.  reduce 43 (src line 490)
+
+
+state 159
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr OR a_expr.    (60)
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	.  reduce 60 (src line 546)
+
+
+state 160
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr AND a_expr.    (61)
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	IS  shift 102
+	.  reduce 61 (src line 547)
+
+
+state 161
+	a_expr:  a_expr IS NULL.    (62)
+
+	.  reduce 62 (src line 548)
+
+
+state 162
+	a_expr:  a_expr IS NOT.NULL 
+
+	NULL  shift 208
+	.  error
+
+
+state 163
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr '+' b_expr.    (69)
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 69 (src line 556)
+
+
+state 164
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr '-' b_expr.    (70)
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 70 (src line 557)
+
+
+state 165
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr '*' b_expr.    (71)
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+
+	.  reduce 71 (src line 558)
+
+
+state 166
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr '/' b_expr.    (72)
+	b_expr:  b_expr.'%' b_expr 
+
+	.  reduce 72 (src line 559)
+
+
+state 167
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	b_expr:  b_expr '%' b_expr.    (73)
+
+	.  reduce 73 (src line 560)
+
+
+state 168
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr '<' b_expr.    (75)
+
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 75 (src line 563)
+
+
+state 169
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr '>' b_expr.    (76)
+
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 76 (src line 564)
+
+
+state 170
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr '=' b_expr.    (77)
+
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 77 (src line 565)
+
+
+state 171
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr LESS_EQUALS b_expr.    (78)
+
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 78 (src line 566)
+
+
+state 172
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr GREATER_EQUALS b_expr.    (79)
+
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 79 (src line 567)
+
+
+state 173
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr NOT_EQUALS b_expr.    (80)
+
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 80 (src line 568)
+
+
+state 174
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr BETWEEN b_expr.AND b_expr 
+
+	AND  shift 209
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  error
+
+
+state 175
+	c_expr:  b_expr NOT_LA BETWEEN.b_expr AND b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 210
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 176
+	subquery:  '(' select_stmt.')' 
+
+	')'  shift 211
+	.  error
+
+
+state 177
+	d_expr:  '(' a_expr ')'.    (90)
+
+	.  reduce 90 (src line 582)
+
+
+state 178
+	func_application:  func_name '(' ')'.    (96)
+
+	.  reduce 96 (src line 599)
+
+
+state 179
+	expr_list:  expr_list.',' a_expr 
+	func_application:  func_name '(' expr_list.')' 
+
+	')'  shift 213
+	','  shift 212
+	.  error
+
+
+state 180
+	expr_list:  a_expr.    (56)
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	.  reduce 56 (src line 541)
+
+
+state 181
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+	func_expr_common_subexpr:  CAST '(' a_expr.AS cast_target ')' 
+
+	AND  shift 101
+	AS  shift 214
+	IS  shift 102
+	OR  shift 100
+	.  error
+
+
+state 182
+	column_name:  name '[' a_expr ']'.    (132)
+
+	.  reduce 132 (src line 755)
+
+
+state 183
+	limit_clause:  FETCH first_or_next opt_select_fetch_first_value.row_or_rows ONLY 
+
+	ROW  shift 190
+	ROWS  shift 191
+	.  error
+
+	row_or_rows  goto 215
+
+state 184
+	opt_select_fetch_first_value:  signed_iconst.    (24)
+
+	.  reduce 24 (src line 409)
+
+
+state 185
+	opt_select_fetch_first_value:  '('.a_expr ')' 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 216
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 186
+	signed_iconst:  ICONST.    (91)
+
+	.  reduce 91 (src line 584)
+
+
+state 187
+	signed_iconst:  '+'.ICONST 
+
+	ICONST  shift 217
+	.  error
+
+
+state 188
+	signed_iconst:  '-'.ICONST 
+
+	ICONST  shift 218
+	.  error
+
+
+state 189
+	offset_clause:  OFFSET d_expr row_or_rows.    (23)
+
+	.  reduce 23 (src line 407)
+
+
+state 190
+	row_or_rows:  ROW.    (27)
+
+	.  reduce 27 (src line 413)
+
+
+state 191
+	row_or_rows:  ROWS.    (28)
+
+	.  reduce 28 (src line 414)
+
+
+state 192
+	order_list:  order_list ','.order 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 135
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	order  goto 219
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 193
+	order:  a_expr opt_asc_desc.    (11)
+
+	.  reduce 11 (src line 360)
+
+
+state 194
+	opt_asc_desc:  ASC.    (12)
+
+	.  reduce 12 (src line 368)
+
+
+state 195
+	opt_asc_desc:  DESC.    (13)
+
+	.  reduce 13 (src line 369)
+
+
+state 196
+	opt_column_list:  '(' name_list ')'.    (135)
+
+	.  reduce 135 (src line 769)
+
+
+state 197
+	name_list:  name_list ','.name 
+
+	IDENT  shift 14
+	.  error
+
+	name  goto 220
+
+state 198
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+	column_name:  column_name '.' name '[' a_expr.']' 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	']'  shift 221
+	.  error
+
+
+state 199
+	join_clause:  select_clause join_type JOIN select_clause join_qual.    (118)
+
+	.  reduce 118 (src line 687)
+
+
+state 200
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+	join_qual:  ON a_expr.    (121)
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	.  reduce 121 (src line 715)
+
+
+state 201
+	simple_select:  SELECT target_list from_clause opt_where_clause group_clause.having_clause 
+	having_clause: .    (55)
+
+	HAVING  shift 223
+	.  reduce 55 (src line 537)
+
+	having_clause  goto 222
+
+state 202
+	group_clause:  GROUP.BY expr_list 
+
+	BY  shift 224
+	.  error
+
+
+state 203
+	where_clause:  WHERE a_expr.    (51)
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	.  reduce 51 (src line 524)
+
+
+state 204
+	from_list:  from_list ','.table_ref 
+
+	IDENT  shift 14
+	'('  shift 119
+	.  error
+
+	subquery  goto 156
+	name  goto 13
+	table_name  goto 155
+	column_name  goto 10
+	table_ref  goto 225
+
+state 205
+	table_ref:  table_name opt_alias_clause.    (128)
+
+	.  reduce 128 (src line 727)
+
+
+state 206
+	table_ref:  subquery opt_alias_clause.    (129)
+
+	.  reduce 129 (src line 734)
+
+
+state 207
+	simple_select:  SELECT distinct_clause target_list from_clause opt_where_clause.group_clause having_clause 
+	group_clause: .    (53)
+
+	GROUP  shift 202
+	.  reduce 53 (src line 529)
+
+	group_clause  goto 226
+
+state 208
+	a_expr:  a_expr IS NOT NULL.    (63)
+
+	.  reduce 63 (src line 549)
+
+
+state 209
+	c_expr:  b_expr BETWEEN b_expr AND.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 227
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 210
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr NOT_LA BETWEEN b_expr.AND b_expr 
+
+	AND  shift 228
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  error
+
+
+state 211
+	subquery:  '(' select_stmt ')'.    (109)
+
+	.  reduce 109 (src line 637)
+
+
+state 212
+	expr_list:  expr_list ','.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 229
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 213
+	func_application:  func_name '(' expr_list ')'.    (97)
+
+	.  reduce 97 (src line 603)
+
+
+state 214
+	func_expr_common_subexpr:  CAST '(' a_expr AS.cast_target ')' 
+
+	BOOL  shift 233
+	FLOAT  shift 235
+	INT  shift 232
+	STRING  shift 236
+	TIME  shift 234
+	.  error
+
+	typename  goto 231
+	cast_target  goto 230
+
+state 215
+	limit_clause:  FETCH first_or_next opt_select_fetch_first_value row_or_rows.ONLY 
+
+	ONLY  shift 237
+	.  error
+
+
+state 216
+	opt_select_fetch_first_value:  '(' a_expr.')' 
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	')'  shift 238
+	.  error
+
+
+state 217
+	signed_iconst:  '+' ICONST.    (92)
+
+	.  reduce 92 (src line 585)
+
+
+state 218
+	signed_iconst:  '-' ICONST.    (93)
+
+	.  reduce 93 (src line 586)
+
+
+state 219
+	order_list:  order_list ',' order.    (10)
+
+	.  reduce 10 (src line 358)
+
+
+state 220
+	name_list:  name_list ',' name.    (138)
+
+	.  reduce 138 (src line 776)
+
+
+state 221
+	column_name:  column_name '.' name '[' a_expr ']'.    (134)
+
+	.  reduce 134 (src line 763)
+
+
+state 222
+	simple_select:  SELECT target_list from_clause opt_where_clause group_clause having_clause.    (36)
+
+	.  reduce 36 (src line 436)
+
+
+state 223
+	having_clause:  HAVING.a_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	a_expr  goto 239
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 224
+	group_clause:  GROUP BY.expr_list 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	EXISTS  shift 47
+	FALSE  shift 57
+	NOT  shift 45
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	expr_list  goto 240
+	a_expr  goto 180
+	b_expr  goto 46
+	c_expr  goto 44
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 225
+	from_list:  from_list ',' table_ref.    (48)
+
+	.  reduce 48 (src line 511)
+
+
+state 226
+	simple_select:  SELECT distinct_clause target_list from_clause opt_where_clause group_clause.having_clause 
+	having_clause: .    (55)
+
+	HAVING  shift 223
+	.  reduce 55 (src line 537)
+
+	having_clause  goto 241
+
+state 227
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr BETWEEN b_expr AND b_expr.    (81)
+
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 81 (src line 569)
+
+
+state 228
+	c_expr:  b_expr NOT_LA BETWEEN b_expr AND.b_expr 
+
+	IDENT  shift 14
+	ICONST  shift 53
+	FCONST  shift 54
+	SCONST  shift 55
+	CAST  shift 64
+	FALSE  shift 57
+	NULL  shift 58
+	TRUE  shift 56
+	'+'  shift 50
+	'-'  shift 51
+	'('  shift 59
+	.  error
+
+	name  goto 60
+	func_name  goto 63
+	column_name  goto 49
+	b_expr  goto 242
+	d_expr  goto 48
+	func_application  goto 61
+	func_expr_common_subexpr  goto 62
+	func_expr  goto 52
+
+state 229
+	expr_list:  expr_list ',' a_expr.    (57)
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	.  reduce 57 (src line 542)
+
+
+state 230
+	func_expr_common_subexpr:  CAST '(' a_expr AS cast_target.')' 
+
+	')'  shift 243
+	.  error
+
+
+state 231
+	cast_target:  typename.    (99)
+
+	.  reduce 99 (src line 613)
+
+
+state 232
+	typename:  INT.    (100)
+
+	.  reduce 100 (src line 615)
+
+
+state 233
+	typename:  BOOL.    (101)
+
+	.  reduce 101 (src line 616)
+
+
+state 234
+	typename:  TIME.    (102)
+
+	.  reduce 102 (src line 617)
+
+
+state 235
+	typename:  FLOAT.    (103)
+
+	.  reduce 103 (src line 618)
+
+
+state 236
+	typename:  STRING.    (104)
+
+	.  reduce 104 (src line 619)
+
+
+state 237
+	limit_clause:  FETCH first_or_next opt_select_fetch_first_value row_or_rows ONLY.    (21)
+
+	.  reduce 21 (src line 401)
+
+
+state 238
+	opt_select_fetch_first_value:  '(' a_expr ')'.    (25)
+
+	.  reduce 25 (src line 410)
+
+
+state 239
+	having_clause:  HAVING a_expr.    (54)
+	a_expr:  a_expr.OR a_expr 
+	a_expr:  a_expr.AND a_expr 
+	a_expr:  a_expr.IS NULL 
+	a_expr:  a_expr.IS NOT NULL 
+
+	AND  shift 101
+	IS  shift 102
+	OR  shift 100
+	.  reduce 54 (src line 533)
+
+
+state 240
+	group_clause:  GROUP BY expr_list.    (52)
+	expr_list:  expr_list.',' a_expr 
+
+	','  shift 212
+	.  reduce 52 (src line 528)
+
+
+state 241
+	simple_select:  SELECT distinct_clause target_list from_clause opt_where_clause group_clause having_clause.    (37)
+
+	.  reduce 37 (src line 447)
+
+
+state 242
+	b_expr:  b_expr.'+' b_expr 
+	b_expr:  b_expr.'-' b_expr 
+	b_expr:  b_expr.'*' b_expr 
+	b_expr:  b_expr.'/' b_expr 
+	b_expr:  b_expr.'%' b_expr 
+	c_expr:  b_expr NOT_LA BETWEEN b_expr AND b_expr.    (82)
+
+	'+'  shift 105
+	'-'  shift 106
+	'*'  shift 107
+	'/'  shift 108
+	'%'  shift 109
+	.  reduce 82 (src line 570)
+
+
+state 243
+	func_expr_common_subexpr:  CAST '(' a_expr AS cast_target ')'.    (98)
+
+	.  reduce 98 (src line 608)
+
+
+75 terminals, 57 nonterminals
+143 grammar rules, 244/8000 states
+0 shift/reduce, 0 reduce/reduce conflicts reported
+106 working sets used
+memory: parser 751/120000
+215 extra closures
+788 shift entries, 6 exceptions
+165 goto entries
+369 entries saved by goto default
+Optimizer space used: output 423/120000
+423 table entries, 21 zero
+maximum spread: 75, maximum offset: 228
