@@ -5,11 +5,12 @@ import (
 	"fmt"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/deepfabric/vectorsql/pkg/logger"
 	"github.com/deepfabric/vectorsql/pkg/sql/client"
 	"github.com/deepfabric/vectorsql/pkg/vm/bv"
 )
 
-func (o *OP) Result(mcpu int, b bv.BV, cli client.Client, vec []float32) (interface{}, error) {
+func (o *OP) Result(log logger.Log, mcpu int, b bv.BV, cli client.Client, vec []float32) (interface{}, error) {
 	var mp *roaring.Bitmap
 
 	switch {
@@ -50,9 +51,9 @@ func (o *OP) Result(mcpu int, b bv.BV, cli client.Client, vec []float32) (interf
 		}
 		if is := mp.ToArray(); len(is) > 0 {
 			{
-				fmt.Printf("query: %v\n", o.N.String()+fmt.Sprintf("WHERE seq IN %s", slice2String(is)))
+				log.Debugf("query: '%v'\n", o.N.String()+fmt.Sprintf(" WHERE seq IN %s", slice2String(is)))
 			}
-			return cli.Query(o.N.String()+fmt.Sprintf("WHERE seq IN %s", slice2String(is)), "people")
+			return cli.Query(o.N.String()+fmt.Sprintf(" WHERE seq IN %s", slice2String(is)), "item")
 		}
 		return nil, nil
 	case o.T != nil && !o.T.IsF:
@@ -67,16 +68,16 @@ func (o *OP) Result(mcpu int, b bv.BV, cli client.Client, vec []float32) (interf
 		}
 		if is := mp.ToArray(); len(is) > 0 {
 			{
-				fmt.Printf("query: %v\n", o.N.String()+fmt.Sprintf("WHERE seq IN %s", slice2String(is)))
+				log.Debugf("query: '%v'\n", o.N.String()+fmt.Sprintf(" WHERE seq IN %s", slice2String(is)))
 			}
-			return cli.Query(o.N.String()+fmt.Sprintf("WHERE seq IN %s", slice2String(is)), "people")
+			return cli.Query(o.N.String()+fmt.Sprintf(" WHERE seq IN %s", slice2String(is)), "item")
 		}
 		return nil, nil
 	default:
 		{
-			fmt.Printf("--query: %v\n", o.N.String())
+			log.Debugf("query: '%v'\n", o.N.String())
 		}
-		return cli.Query(o.N.String(), "people")
+		return cli.Query(o.N.String(), "item")
 	}
 }
 

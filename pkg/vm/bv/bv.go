@@ -28,7 +28,7 @@ func init() {
 func randVector(n int) *roaring.Bitmap {
 	mp := roaring.New()
 	for i := 0; i < n; i++ {
-		mp.Add(rand.Uint32())
+		mp.Add(rand.Uint32() % 1000)
 	}
 	return mp
 }

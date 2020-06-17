@@ -9,7 +9,7 @@ require (
 	github.com/deepfabric/thinkkv v0.0.0-20200521081220-d5d1d5608c40
 	github.com/google/btree v1.0.0 // indirect
 	github.com/hashicorp/golang-lru v0.5.4
-	github.com/jmoiron/sqlx v1.2.0
+	github.com/pilosa/pilosa v1.4.0
 	github.com/pkg/errors v0.9.1
 	github.com/valyala/fasthttp v1.12.0
 	golang.org/x/text v0.3.2

@@ -29,7 +29,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	db := pb.New("test.db", nil, 1024*1024*1024, false, false)
+	db := pb.New("idx.db", nil, 1024*1024*1024, false, false)
 	stg := storage.New(2, db, bc, rc)
 	srv := query.New(8888, 2, bv.New(), logger.New(os.Stderr, "vectorsql"), cli, vector.New("http://172.19.0.17:6933/face_emb"), stg)
 	{

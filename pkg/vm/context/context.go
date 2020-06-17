@@ -8,19 +8,17 @@ import (
 )
 
 var Types = map[string]int32{
-	"seq":    types.T_int,
-	"dt":     types.T_time,
-	"age":    types.T_uint8,
-	"gender": types.T_uint8,
-	"area":   types.T_string,
+	"seq":  types.T_uint32,
+	"age":  types.T_uint8,
+	"sex":  types.T_uint8,
+	"area": types.T_string,
 }
 
 var Tables = map[string]string{
-	"seq":    "people",
-	"age":    "people",
-	"gender": "people",
-	"dt":     "people_events",
-	"area":   "people_events",
+	"seq":  "people",
+	"age":  "people",
+	"sex":  "people",
+	"area": "people",
 }
 
 func New(cli client.Client) *context {

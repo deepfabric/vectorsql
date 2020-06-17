@@ -11,8 +11,8 @@ import (
 )
 
 func main() {
-	if len(os.Args[2]) < 3 {
-		fmt.Printf("Usage: cli query images[...]")
+	if len(os.Args) < 3 {
+		fmt.Printf("Usage: cli query images...")
 		return
 	}
 	fs := make(map[string]*request.Part)

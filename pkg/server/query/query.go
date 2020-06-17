@@ -62,7 +62,7 @@ func (q *query) dealQuery(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	start := time.Now()
-	o, err := build.New(qr, context.New(nil), q.stg).Build()
+	o, err := build.New(qr, context.New(q.cli), q.stg).Build()
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		hr.Msg = err.Error()
@@ -70,7 +70,19 @@ func (q *query) dealQuery(ctx *fasthttp.RequestCtx) {
 		ctx.Write(data)
 		return
 	}
-	rows, err := o.Result(q.mcpu, q.b, q.cli, vec)
+	{
+		q.log.Debugf("T: %v\n", o.T)
+	}
+	{
+		q.log.Debugf("N: %v\n", o.N)
+	}
+	{
+		q.log.Debugf("CF: %v\n", o.Cf)
+	}
+	{
+		q.log.Debugf("IF: %v\n", o.If)
+	}
+	rows, err := o.Result(q.log, q.mcpu, q.b, q.cli, vec)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		hr.Msg = err.Error()

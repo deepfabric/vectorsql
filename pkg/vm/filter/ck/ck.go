@@ -23,7 +23,7 @@ func (c *ck) Bitmap(_ int) (*roaring.Bitmap, error) {
 	if err != nil {
 		return nil, err
 	}
-	return unmarshalBitMap([]byte(rows.([]client.Bitmap)[0].Result))
+	return unmarshalBitMap([]byte(rows[0]))
 }
 
 func unmarshalBitMap(data []byte) (*roaring.Bitmap, error) {
