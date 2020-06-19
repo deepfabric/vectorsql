@@ -7,7 +7,7 @@
 vectorsql仅仅支持select-stmt，一个典型的查询如下:
 
 ```sql
-select name from A where area = '上海' top 5 by vec
+select name from A where area = '上海' top 5
 ```
 
 sql的grammer如下:
