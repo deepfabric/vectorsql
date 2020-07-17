@@ -3,14 +3,12 @@ package types
 import "fmt"
 
 const (
-	T_any = iota
-	T_int // int64
-	T_null
+	T_int = iota // int64
 	T_bool
-	T_time
 	T_float // float64
 	T_array
 	T_string
+	T_timestamp
 	T_uint8
 	T_uint16
 	T_uint32
@@ -23,62 +21,52 @@ const (
 	T_float64
 )
 
-type T struct {
-	Oid int32
+type T uint32
+
+func (t T) Size() int {
+	switch t {
+	case T_int:
+		return 8
+	case T_bool:
+		return 1
+	case T_timestamp:
+		return 8
+	case T_float:
+		return 8
+	case T_string:
+		return 10
+	case T_uint8:
+		return 1
+	case T_uint16:
+		return 2
+	case T_uint32:
+		return 4
+	case T_uint64:
+		return 8
+	case T_int8:
+		return 1
+	case T_int16:
+		return 2
+	case T_int32:
+		return 4
+	case T_int64:
+		return 8
+	case T_float32:
+		return 4
+	case T_float64:
+		return 8
+	}
+	return -1
 }
 
-var (
-	Any = &T{T_any}
-
-	Null = &T{T_null}
-
-	Bool = &T{T_bool}
-
-	Array = &T{T_array}
-
-	String = &T{T_string}
-
-	Int = &T{T_int}
-
-	Time = &T{T_time}
-
-	Float = &T{T_float}
-
-	Uint8 = &T{T_uint8}
-
-	Uint16 = &T{T_uint16}
-
-	Uint32 = &T{T_uint32}
-
-	Uint64 = &T{T_uint64}
-
-	Int8 = &T{T_int8}
-
-	Int16 = &T{T_int16}
-
-	Int32 = &T{T_int32}
-
-	Int64 = &T{T_int64}
-
-	Float32 = &T{T_float32}
-
-	Float64 = &T{T_float64}
-)
-
-func (t *T) String() string { return t.SQLString() }
-
-func (t *T) SQLString() string {
-	switch t.Oid {
-	case T_any:
-		return "ANY"
+func (t T) String() string {
+	switch t {
 	case T_int:
 		return "INT"
-	case T_null:
-		return "NULL"
 	case T_bool:
 		return "BOOL"
-	case T_time:
-		return "TIME"
+	case T_timestamp:
+		return "TIMESTAMP"
 	case T_float:
 		return "FLOAT"
 	case T_array:
@@ -106,5 +94,5 @@ func (t *T) SQLString() string {
 	case T_float64:
 		return "FLOAT64"
 	}
-	panic(fmt.Errorf("unexpected oid: %v", t.Oid))
+	panic(fmt.Errorf("unexpected oid: %d", t))
 }

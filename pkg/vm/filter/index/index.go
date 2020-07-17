@@ -4,19 +4,20 @@ import (
 	"bytes"
 
 	"github.com/RoaringBitmap/roaring"
-	"github.com/deepfabric/vectorsql/pkg/vm/filter"
+	"github.com/deepfabric/vectorsql/pkg/vm/filter/index/ifilter"
+	Roaring "github.com/pilosa/pilosa/roaring"
 )
 
-func New(fs []filter.Filter) *index {
+func New(fs []ifilter.Filter) *index {
 	return &index{fs}
 }
 
-func (i *index) String() string {
-	if len(i.fs) == 0 {
-		return i.fs[0].String()
+func (r *index) String() string {
+	if len(r.fs) == 0 {
+		return r.fs[0].String()
 	}
 	var buf bytes.Buffer
-	for i, f := range i.fs {
+	for i, f := range r.fs {
 		if i > 0 {
 			buf.WriteString(" AND ")
 		}
@@ -27,14 +28,32 @@ func (i *index) String() string {
 	return buf.String()
 }
 
-func (i *index) Bitmap(mcpu int) (*roaring.Bitmap, error) {
-	ms := make([]*roaring.Bitmap, 0, len(i.fs))
-	for _, v := range i.fs {
-		mp, err := v.Bitmap(mcpu)
+func (r *index) Bitmap() (*roaring.Bitmap, error) {
+	var m *Roaring.Bitmap
+
+	for _, v := range r.fs {
+		mp, err := v.Bitmap()
 		if err != nil {
 			return nil, err
 		}
-		ms = append(ms, mp)
+		if m == nil {
+			m = mp
+		} else {
+			m = m.Intersect(mp)
+		}
 	}
-	return roaring.ParAnd(mcpu, ms...), nil
+	return convert(m), nil
+}
+
+func convert(mp *Roaring.Bitmap) *roaring.Bitmap {
+	var xs []uint32
+
+	{
+		itr := mp.Iterator()
+		itr.Seek(0)
+		for v, eof := itr.Next(); !eof; v, eof = itr.Next() {
+			xs = append(xs, uint32(v))
+		}
+	}
+	return roaring.BitmapOf(xs...)
 }

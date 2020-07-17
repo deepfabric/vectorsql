@@ -1,7 +1,6 @@
 package overload
 
 import (
-	"github.com/deepfabric/vectorsql/pkg/vm/types"
 	"github.com/deepfabric/vectorsql/pkg/vm/value"
 )
 
@@ -28,6 +27,7 @@ const (
 	// binary operator
 	Or  // logical operator
 	And // logical operator
+
 	Plus
 	Minus
 	Mult
@@ -36,6 +36,8 @@ const (
 	Typecast
 	Like
 	NotLike
+	Match
+	NotMatch
 
 	// binary operator - comparison operator
 	EQ
@@ -72,6 +74,8 @@ var OpName = [...]string{
 	Typecast: "typecast",
 	Like:     "like",
 	NotLike:  "not like",
+	Match:    "match",
+	NotMatch: "not match",
 
 	EQ: "=",
 	LT: "<",
@@ -85,26 +89,26 @@ var OpName = [...]string{
 
 // UnaryOp is a unary operator.
 type UnaryOp struct {
-	Typ        *types.T
-	ReturnType *types.T
-	Fn         func(value.Value) (value.Value, error)
+	Typ        uint32
+	ReturnType uint32
+	Fn         func(value.Values) (value.Values, error)
 }
 
 // BinOp is a binary operator.
 type BinOp struct {
-	LeftType   *types.T
-	RightType  *types.T
-	ReturnType *types.T
+	LeftType   uint32
+	RightType  uint32
+	ReturnType uint32
 
-	Fn func(value.Value, value.Value) (value.Value, error)
+	Fn func(value.Values, value.Values) (value.Values, error)
 }
 
 // MultiOp is a multiple operator.
 type MultiOp struct {
 	Min        int // minimum number of parameters
 	Max        int // maximum number of parameters, -1 means unlimited
-	Typ        *types.T
-	ReturnType *types.T
+	Typ        uint32
+	ReturnType uint32
 
-	Fn func([]value.Value) (value.Value, error)
+	Fn func([]value.Values) (value.Values, error)
 }

@@ -3,7 +3,6 @@ package signed
 import (
 	"bytes"
 
-	Roaring "github.com/RoaringBitmap/roaring"
 	Bsi "github.com/deepfabric/vectorsql/pkg/bsi"
 	"github.com/deepfabric/vectorsql/pkg/vm/util/encoding"
 	"github.com/pilosa/pilosa/roaring"
@@ -20,8 +19,8 @@ func New(bitSize int) *bsi {
 	}
 }
 
-func (b *bsi) Map() *Roaring.Bitmap {
-	return convert(b.subMap(bsiExistsBit))
+func (b *bsi) Map() *roaring.Bitmap {
+	return b.subMap(bsiExistsBit)
 }
 
 func (b *bsi) Clone() Bsi.Bsi {
@@ -81,24 +80,82 @@ func (b *bsi) Read(data []byte) error {
 	return nil
 }
 
-func (b *bsi) Get(k uint32) (interface{}, bool) {
+func (b *bsi) Count(filter *roaring.Bitmap) uint64 {
+	mp := b.subMap(bsiExistsBit)
+	if filter != nil {
+		mp = mp.Intersect(filter)
+	}
+	return mp.Count()
+}
+
+func (b *bsi) Min(filter *roaring.Bitmap) (interface{}, uint64) {
+	mp := b.subMap(bsiExistsBit)
+	if filter != nil {
+		mp = mp.Intersect(filter)
+	}
+	if mp.Count() == 0 {
+		return 0, 0
+	}
+	if mq := b.subMap(bsiSignBit).Intersect(mp); mq.Any() {
+		min, count := b.max(mq)
+		return -min, count
+	}
+	return b.min(mp)
+}
+
+func (b *bsi) Max(filter *roaring.Bitmap) (interface{}, uint64) {
+	mp := b.subMap(bsiExistsBit)
+	if filter != nil {
+		mp = mp.Intersect(filter)
+	}
+	if !mp.Any() {
+		return 0, 0
+	}
+	mq := mp.Difference(b.subMap(bsiSignBit))
+	if !mq.Any() {
+		max, count := b.min(mp)
+		return -max, count
+	}
+	return b.max(mq)
+}
+
+func (b *bsi) Sum(filter *roaring.Bitmap) (interface{}, uint64) {
+	var sum int64
+
+	mp := b.subMap(bsiExistsBit)
+	if filter != nil {
+		mp = mp.Intersect(filter)
+	}
+	count := mp.Count()
+	nmp := b.subMap(bsiSignBit)
+	pmp := mp.Difference(nmp)
+	for i, j := uint(0), uint(b.bitSize); i < j; i++ {
+		mq := b.subMap(uint64(bsiOffsetBit + i))
+		n := int64((1 << i) * mq.IntersectionCount(pmp))
+		m := int64((1 << i) * mq.IntersectionCount(nmp))
+		sum += n - m
+	}
+	return sum, count
+}
+
+func (b *bsi) Get(k uint64) (interface{}, bool) {
 	var v int64
 
 	if !b.bit(bsiExistsBit, k) {
 		return -1, false
 	}
 	for i, j := uint(0), uint(b.bitSize); i < j; i++ {
-		if b.bit(uint32(bsiOffsetBit+i), k) {
+		if b.bit(uint64(bsiOffsetBit+i), k) {
 			v |= (1 << i)
 		}
 	}
-	if b.bit(uint32(bsiSignBit), k) {
+	if b.bit(bsiSignBit, k) {
 		v = -v
 	}
 	return v, true
 }
 
-func (b *bsi) Set(k uint32, e interface{}) error {
+func (b *bsi) Set(k uint64, e interface{}) error {
 	v := e.(int64)
 	uv := uint64(v)
 	if v < 0 {
@@ -106,26 +163,26 @@ func (b *bsi) Set(k uint32, e interface{}) error {
 	}
 	for i, j := uint(0), uint(b.bitSize); i < j; i++ {
 		if uv&(1<<i) != 0 {
-			b.setBit(uint32(bsiOffsetBit+i), k)
+			b.setBit(uint64(bsiOffsetBit+i), k)
 		} else {
-			b.clearBit(uint32(bsiOffsetBit+i), k)
+			b.clearBit(uint64(bsiOffsetBit+i), k)
 		}
 	}
-	b.setBit(uint32(bsiExistsBit), k)
+	b.setBit(bsiExistsBit, k)
 	if v < 0 {
-		b.setBit(uint32(bsiSignBit), k)
+		b.setBit(bsiSignBit, k)
 	} else {
-		b.clearBit(uint32(bsiSignBit), k)
+		b.clearBit(bsiSignBit, k)
 	}
 	return nil
 }
 
-func (b *bsi) Del(k uint32) error {
-	b.clearBit(uint32(bsiExistsBit), k)
+func (b *bsi) Del(k uint64) error {
+	b.clearBit(bsiExistsBit, k)
 	return nil
 }
 
-func (b *bsi) Eq(e interface{}) (*Roaring.Bitmap, error) {
+func (b *bsi) Eq(e interface{}) (*roaring.Bitmap, error) {
 	v := e.(int64)
 	uv := uint64(v)
 	mp := b.subMap(bsiExistsBit)
@@ -137,15 +194,15 @@ func (b *bsi) Eq(e interface{}) (*Roaring.Bitmap, error) {
 	}
 	for i := b.bitSize - 1; i >= 0; i-- {
 		if (uv>>uint(i))&1 == 1 {
-			mp = mp.Intersect(b.subMap(uint32(bsiOffsetBit + i)))
+			mp = mp.Intersect(b.subMap(uint64(bsiOffsetBit + i)))
 		} else {
-			mp = mp.Difference(b.subMap(uint32(bsiOffsetBit + i)))
+			mp = mp.Difference(b.subMap(uint64(bsiOffsetBit + i)))
 		}
 	}
-	return convert(mp), nil
+	return mp, nil
 }
 
-func (b *bsi) Ne(e interface{}) (*Roaring.Bitmap, error) {
+func (b *bsi) Ne(e interface{}) (*roaring.Bitmap, error) {
 	v := e.(int64)
 	uv := uint64(v)
 	mp := b.subMap(bsiExistsBit)
@@ -157,15 +214,15 @@ func (b *bsi) Ne(e interface{}) (*Roaring.Bitmap, error) {
 	}
 	for i := b.bitSize - 1; i >= 0; i-- {
 		if (uv>>uint(i))&1 == 1 {
-			mp = mp.Intersect(b.subMap(uint32(bsiOffsetBit + i)))
+			mp = mp.Intersect(b.subMap(uint64(bsiOffsetBit + i)))
 		} else {
-			mp = mp.Difference(b.subMap(uint32(bsiOffsetBit + i)))
+			mp = mp.Difference(b.subMap(uint64(bsiOffsetBit + i)))
 		}
 	}
-	return convert(b.subMap(bsiExistsBit).Difference(mp)), nil
+	return b.subMap(bsiExistsBit).Difference(mp), nil
 }
 
-func (b *bsi) Lt(e interface{}) (*Roaring.Bitmap, error) {
+func (b *bsi) Lt(e interface{}) (*roaring.Bitmap, error) {
 	v := e.(int64)
 	uv := uint64(v)
 	if v < 0 {
@@ -174,12 +231,12 @@ func (b *bsi) Lt(e interface{}) (*Roaring.Bitmap, error) {
 	mp := b.subMap(bsiExistsBit)
 	if v >= 0 {
 		mp = b.lt(uv, mp.Difference(b.subMap(bsiSignBit)), false)
-		return convert(b.subMap(bsiSignBit).Union(mp)), nil
+		return b.subMap(bsiSignBit).Union(mp), nil
 	}
-	return convert(b.gt(uv, mp.Intersect(b.subMap(bsiSignBit)), false)), nil
+	return b.gt(uv, mp.Intersect(b.subMap(bsiSignBit)), false), nil
 }
 
-func (b *bsi) Le(e interface{}) (*Roaring.Bitmap, error) {
+func (b *bsi) Le(e interface{}) (*roaring.Bitmap, error) {
 	v := e.(int64)
 	uv := uint64(v)
 	if v < 0 {
@@ -188,12 +245,12 @@ func (b *bsi) Le(e interface{}) (*Roaring.Bitmap, error) {
 	mp := b.subMap(bsiExistsBit)
 	if v >= 0 {
 		mp = b.lt(uv, mp.Difference(b.subMap(bsiSignBit)), true)
-		return convert(b.subMap(bsiSignBit).Union(mp)), nil
+		return b.subMap(bsiSignBit).Union(mp), nil
 	}
-	return convert(b.gt(uv, mp.Intersect(b.subMap(bsiSignBit)), true)), nil
+	return b.gt(uv, mp.Intersect(b.subMap(bsiSignBit)), true), nil
 }
 
-func (b *bsi) Gt(e interface{}) (*Roaring.Bitmap, error) {
+func (b *bsi) Gt(e interface{}) (*roaring.Bitmap, error) {
 	v := e.(int64)
 	uv := uint64(v)
 	if v < 0 {
@@ -201,13 +258,13 @@ func (b *bsi) Gt(e interface{}) (*Roaring.Bitmap, error) {
 	}
 	mp := b.subMap(bsiExistsBit)
 	if v >= 0 {
-		return convert(b.gt(uv, mp.Difference(b.subMap(uint32(bsiSignBit))), false)), nil
+		return b.gt(uv, mp.Difference(b.subMap(bsiSignBit)), false), nil
 	}
-	mq := b.lt(uv, mp.Intersect(b.subMap(uint32(bsiSignBit))), false)
-	return convert(mp.Difference(b.subMap(uint32(bsiSignBit))).Union(mq)), nil
+	mq := b.lt(uv, mp.Intersect(b.subMap(bsiSignBit)), false)
+	return mp.Difference(b.subMap(bsiSignBit)).Union(mq), nil
 }
 
-func (b *bsi) Ge(e interface{}) (*Roaring.Bitmap, error) {
+func (b *bsi) Ge(e interface{}) (*roaring.Bitmap, error) {
 	v := e.(int64)
 	uv := uint64(v)
 	if v < 0 {
@@ -215,10 +272,46 @@ func (b *bsi) Ge(e interface{}) (*Roaring.Bitmap, error) {
 	}
 	mp := b.subMap(bsiExistsBit)
 	if v >= 0 {
-		return convert(b.gt(uv, mp.Difference(b.subMap(uint32(bsiSignBit))), true)), nil
+		return b.gt(uv, mp.Difference(b.subMap(uint64(bsiSignBit))), true), nil
 	}
-	mq := b.lt(uv, mp.Intersect(b.subMap(uint32(bsiSignBit))), true)
-	return convert(mp.Difference(b.subMap(uint32(bsiSignBit))).Union(mq)), nil
+	mq := b.lt(uv, mp.Intersect(b.subMap(uint64(bsiSignBit))), true)
+	return mp.Difference(b.subMap(uint64(bsiSignBit))).Union(mq), nil
+}
+
+func (b *bsi) min(filter *roaring.Bitmap) (int64, uint64) {
+	var min int64
+	var count uint64
+
+	for i := b.bitSize - 1; i >= 0; i-- {
+		mp := filter.Difference(b.subMap(uint64(bsiOffsetBit + i)))
+		count = mp.Count()
+		if count > 0 {
+			filter = mp
+		} else {
+			min += (1 << uint(i))
+			if i == 0 {
+				count = filter.Count()
+			}
+		}
+	}
+	return min, count
+}
+
+func (b *bsi) max(filter *roaring.Bitmap) (int64, uint64) {
+	var max int64
+	var count uint64
+
+	for i := b.bitSize - 1; i >= 0; i-- {
+		mp := b.subMap(uint64(bsiOffsetBit + i)).Intersect(filter)
+		count = mp.Count()
+		if count > 0 {
+			max += (1 << uint(i))
+			filter = mp
+		} else if i == 0 {
+			count = filter.Count()
+		}
+	}
+	return max, count
 }
 
 func (b *bsi) lt(v uint64, mp *roaring.Bitmap, eq bool) *roaring.Bitmap {
@@ -228,7 +321,7 @@ func (b *bsi) lt(v uint64, mp *roaring.Bitmap, eq bool) *roaring.Bitmap {
 		bit := (v >> uint(i)) & 1
 		if zflg {
 			if bit == 0 {
-				mp = mp.Difference(b.subMap(uint32(bsiOffsetBit + i)))
+				mp = mp.Difference(b.subMap(uint64(bsiOffsetBit + i)))
 				continue
 			} else {
 				zflg = false
@@ -238,14 +331,14 @@ func (b *bsi) lt(v uint64, mp *roaring.Bitmap, eq bool) *roaring.Bitmap {
 			if bit == 0 {
 				return mq
 			}
-			return mp.Difference(b.subMap(uint32(bsiOffsetBit + i)).Difference(mq))
+			return mp.Difference(b.subMap(uint64(bsiOffsetBit + i)).Difference(mq))
 		}
 		if bit == 0 {
-			mp = mp.Difference(b.subMap(uint32(bsiOffsetBit + i)).Difference(mq))
+			mp = mp.Difference(b.subMap(uint64(bsiOffsetBit + i)).Difference(mq))
 			continue
 		}
 		if i > 0 {
-			mq = mq.Union(mp.Difference(b.subMap(uint32(bsiOffsetBit + i))))
+			mq = mq.Union(mp.Difference(b.subMap(uint64(bsiOffsetBit + i))))
 		}
 	}
 	return mp
@@ -259,25 +352,25 @@ func (b *bsi) gt(v uint64, mp *roaring.Bitmap, eq bool) *roaring.Bitmap {
 			if bit == 1 {
 				return mq
 			}
-			return mp.Difference(mp.Difference(b.subMap(uint32(bsiOffsetBit + i))).Difference(mq))
+			return mp.Difference(mp.Difference(b.subMap(uint64(bsiOffsetBit + i))).Difference(mq))
 		}
 		if bit == 1 {
-			mp = mp.Difference(mp.Difference(b.subMap(uint32(bsiOffsetBit + i))).Difference(mq))
+			mp = mp.Difference(mp.Difference(b.subMap(uint64(bsiOffsetBit + i))).Difference(mq))
 			continue
 		}
 		if i > 0 {
-			mq = mq.Union(mp.Intersect(b.subMap(uint32(bsiOffsetBit + i))))
+			mq = mq.Union(mp.Intersect(b.subMap(uint64(bsiOffsetBit + i))))
 		}
 	}
 	return mp
 }
 
 // x is the bit offset, y is row id
-func (b *bsi) setBit(x, y uint32)   { b.ms[x].Add(uint64(y)) }
-func (b *bsi) clearBit(x, y uint32) { b.ms[x].Remove(uint64(y)) }
-func (b *bsi) bit(x, y uint32) bool { return b.ms[x].Contains(uint64(y)) }
+func (b *bsi) setBit(x, y uint64)   { b.ms[x].Add(y) }
+func (b *bsi) clearBit(x, y uint64) { b.ms[x].Remove(y) }
+func (b *bsi) bit(x, y uint64) bool { return b.ms[x].Contains(y) }
 
-func (b *bsi) subMap(x uint32) *roaring.Bitmap { return b.ms[x] }
+func (b *bsi) subMap(x uint64) *roaring.Bitmap { return b.ms[x] }
 
 func show(mp *roaring.Bitmap) ([]byte, error) {
 	var buf bytes.Buffer
@@ -286,17 +379,4 @@ func show(mp *roaring.Bitmap) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
-}
-
-func convert(mp *roaring.Bitmap) *Roaring.Bitmap {
-	var xs []uint32
-
-	{
-		itr := mp.Iterator()
-		itr.Seek(0)
-		for v, eof := itr.Next(); !eof; v, eof = itr.Next() {
-			xs = append(xs, uint32(v))
-		}
-	}
-	return Roaring.BitmapOf(xs...)
 }

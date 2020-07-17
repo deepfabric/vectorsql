@@ -1,7 +1,7 @@
 package bsi
 
 import (
-	"github.com/RoaringBitmap/roaring"
+	"github.com/pilosa/pilosa/roaring"
 )
 
 type Bsi interface {
@@ -11,9 +11,14 @@ type Bsi interface {
 	Read([]byte) error
 	Show() ([]byte, error)
 
-	Del(uint32) error
-	Set(uint32, interface{}) error
-	Get(uint32) (interface{}, bool)
+	Del(uint64) error
+	Set(uint64, interface{}) error
+	Get(uint64) (interface{}, bool)
+
+	Count(*roaring.Bitmap) uint64
+	Min(*roaring.Bitmap) (interface{}, uint64)
+	Max(*roaring.Bitmap) (interface{}, uint64)
+	Sum(*roaring.Bitmap) (interface{}, uint64)
 
 	Eq(interface{}) (*roaring.Bitmap, error)
 	Ne(interface{}) (*roaring.Bitmap, error)

@@ -4,8 +4,8 @@ import "database/sql"
 
 type Client interface {
 	Close() error
+	Exec(string, [][]interface{}) error
 	Query(string, string) ([]string, error)
-	Insert(string, string, [][]interface{}) error
 }
 
 type client struct {

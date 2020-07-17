@@ -1,7 +1,6 @@
 package value
 
 import (
-	"fmt"
 	"strconv"
 
 	"github.com/deepfabric/vectorsql/pkg/vm/types"
@@ -12,38 +11,12 @@ func NewInt(v int64) *Int {
 	return &r
 }
 
-func AsInt(v interface{}) (Int, bool) {
-	switch t := v.(type) {
-	case *Int:
-		return *t, true
-	default:
-		return 0, false
-	}
-}
-
-// MustBeInt attempts to retrieve a Int from a value, panicking if the
-// assertion fails.
-func MustBeInt(v interface{}) int64 {
-	i, ok := AsInt(v)
-	if !ok {
-		panic(fmt.Errorf("expected *Int, found %T", v))
-	}
-	return int64(i)
-}
-
-func GetInt(v Value) (Int, error) {
-	if i, ok := v.(*Int); ok {
-		return *i, nil
-	}
-	return 0, fmt.Errorf("cannot convert %s to type %s", v.ResolvedType(), types.Int)
-}
-
 func (a *Int) String() string {
 	return strconv.FormatInt(int64(*a), 10)
 }
 
-func (_ *Int) ResolvedType() *types.T {
-	return types.Int
+func (_ *Int) ResolvedType() types.T {
+	return types.T_int
 }
 
 // ParseInt parses and returns the *Int value represented by the provided
@@ -51,7 +24,7 @@ func (_ *Int) ResolvedType() *types.T {
 func ParseInt(s string) (*Int, error) {
 	i, err := strconv.ParseInt(s, 0, 64)
 	if err != nil {
-		return nil, makeParseError(s, types.Int, err)
+		return nil, makeParseError(s, types.T_int, err)
 	}
 	return NewInt(i), nil
 }
@@ -59,9 +32,6 @@ func ParseInt(s string) (*Int, error) {
 func (a *Int) Compare(v Value) int {
 	var x, y int64
 
-	if v == ConstNull {
-		return 1 // NULL is less than any non-NULL value
-	}
 	x = int64(*a)
 	switch b := v.(type) {
 	case *Int:
@@ -79,8 +49,7 @@ func (a *Int) Compare(v Value) int {
 	}
 }
 
-func (_ *Int) Size() int                              { return 9 }
-func (_ *Int) IsLogical() bool                        { return false }
-func (_ *Int) IsAndOnly() bool                        { return true }
-func (_ *Int) Attributes() []string                   { return []string{} }
-func (a *Int) Eval(_ map[string]Value) (Value, error) { return a, nil }
+func (_ *Int) Size() int            { return 9 }
+func (_ *Int) IsLogical() bool      { return false }
+func (_ *Int) IsAndOnly() bool      { return true }
+func (_ *Int) Attributes() []string { return []string{} }

@@ -4,5 +4,5 @@ import "github.com/RoaringBitmap/roaring"
 
 type Filter interface {
 	String() string
-	Bitmap(int) (*roaring.Bitmap, error)
+	Bitmap() (*roaring.Bitmap, error)
 }

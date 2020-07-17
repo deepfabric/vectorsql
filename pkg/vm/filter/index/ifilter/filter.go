@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"fmt"
 
-	"github.com/RoaringBitmap/roaring"
-	"github.com/deepfabric/vectorsql/pkg/vm/container/relation"
+	"github.com/deepfabric/vectorsql/pkg/storage"
+	"github.com/pilosa/pilosa/roaring"
 )
 
-func New(cs []*Condition, r relation.Relation) *filter {
+func New(cs []*Condition, r storage.Relation) *filter {
 	return &filter{cs, r}
 }
 
@@ -38,8 +38,9 @@ func (f *filter) String() string {
 	return buf.String()
 }
 
-func (f *filter) Bitmap(mcpu int) (*roaring.Bitmap, error) {
-	ms := make([]*roaring.Bitmap, 0, len(f.cs))
+func (f *filter) Bitmap() (*roaring.Bitmap, error) {
+	var m *roaring.Bitmap
+
 	for _, c := range f.cs {
 		switch c.Op {
 		case EQ:
@@ -47,53 +48,76 @@ func (f *filter) Bitmap(mcpu int) (*roaring.Bitmap, error) {
 			if err != nil {
 				return nil, err
 			}
-			ms = append(ms, mp)
+			if m == nil {
+				m = mp
+			} else {
+				m = m.Intersect(mp)
+			}
 		case NE:
 			mp, err := f.r.Ne(c.Name, c.Val)
 			if err != nil {
 				return nil, err
 			}
-			ms = append(ms, mp)
+			if m == nil {
+				m = mp
+			} else {
+				m = m.Intersect(mp)
+			}
 		case LT:
 			mp, err := f.r.Lt(c.Name, c.Val)
 			if err != nil {
 				return nil, err
 			}
-			ms = append(ms, mp)
+			if m == nil {
+				m = mp
+			} else {
+				m = m.Intersect(mp)
+			}
 		case LE:
 			mp, err := f.r.Le(c.Name, c.Val)
 			if err != nil {
 				return nil, err
 			}
-			ms = append(ms, mp)
+			if m == nil {
+				m = mp
+			} else {
+				m = m.Intersect(mp)
+			}
 		case GT:
 			mp, err := f.r.Gt(c.Name, c.Val)
 			if err != nil {
 				return nil, err
 			}
-			ms = append(ms, mp)
+			if m == nil {
+				m = mp
+			} else {
+				m = m.Intersect(mp)
+			}
 		case GE:
 			mp, err := f.r.Ge(c.Name, c.Val)
 			if err != nil {
 				return nil, err
 			}
-			ms = append(ms, mp)
+			if m == nil {
+				m = mp
+			} else {
+				m = m.Intersect(mp)
+			}
 		}
 	}
 	if !f.r.IsEvent() {
-		return roaring.ParAnd(mcpu, ms...), nil
+		return m, nil
 	}
-	mp, err := f.r.IdBitmap()
+	mp, err := f.r.IdMap()
 	if err != nil {
 		return nil, err
 	}
-	is := roaring.ParAnd(mcpu, ms...).ToArray()
-	var xs []uint32
+	is := m.Slice()
+	var xs []uint64
 	for _, i := range is {
-		v, ok := mp.Get(i)
-		if ok {
-			xs = append(xs, v.(uint32))
+		if v, ok := mp.Get(i); ok {
+			xs = append(xs, v.(uint64))
 		}
 	}
-	return roaring.BitmapOf(xs...), nil
+	return roaring.NewBitmap(xs...), nil
 }

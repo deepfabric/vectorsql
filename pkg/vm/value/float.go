@@ -13,30 +13,6 @@ func NewFloat(v float64) *Float {
 	return &r
 }
 
-func AsFloat(v interface{}) (Float, bool) {
-	switch t := v.(type) {
-	case *Float:
-		return *t, true
-	default:
-		return 0.0, false
-	}
-}
-
-func MustBeFloat(v interface{}) float64 {
-	f, ok := AsFloat(v)
-	if !ok {
-		panic(fmt.Errorf("expected *Float, found %T", v))
-	}
-	return float64(f)
-}
-
-func GetFloat(v Value) (Float, error) {
-	if f, ok := v.(*Float); ok {
-		return *f, nil
-	}
-	return 0, fmt.Errorf("cannot convert %s to type %s", v.ResolvedType(), types.Float)
-}
-
 func (a *Float) String() string {
 	f := float64(*a)
 	if _, frac := math.Modf(f); frac == 0 && -1000000 < *a && *a < 1000000 {
@@ -46,8 +22,8 @@ func (a *Float) String() string {
 	}
 }
 
-func (_ *Float) ResolvedType() *types.T {
-	return types.Float
+func (_ *Float) ResolvedType() types.T {
+	return types.T_float
 }
 
 // ParseFloat parses and returns the *Float value represented by the provided
@@ -55,7 +31,7 @@ func (_ *Float) ResolvedType() *types.T {
 func ParseFloat(s string) (*Float, error) {
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return nil, makeParseError(s, types.Float, err)
+		return nil, makeParseError(s, types.T_float, err)
 	}
 	return NewFloat(f), nil
 }
@@ -63,9 +39,6 @@ func ParseFloat(s string) (*Float, error) {
 func (a *Float) Compare(v Value) int {
 	var x, y float64
 
-	if v == ConstNull {
-		return 1 // NULL is less than any non-NULL value
-	}
 	x = float64(*a)
 	switch b := v.(type) {
 	case *Float:
@@ -73,7 +46,7 @@ func (a *Float) Compare(v Value) int {
 	default:
 		panic(makeUnsupportedComparisonMessage(a, v))
 	}
-	// NaN sorts before non-NaN (#10109).
+	// NaN sorts before non-NaN
 	switch {
 	case x < y:
 		return -1
@@ -91,8 +64,7 @@ func (a *Float) Compare(v Value) int {
 	return 1
 }
 
-func (_ *Float) Size() int                              { return 9 }
-func (_ *Float) IsLogical() bool                        { return false }
-func (_ *Float) IsAndOnly() bool                        { return true }
-func (_ *Float) Attributes() []string                   { return []string{} }
-func (a *Float) Eval(_ map[string]Value) (Value, error) { return a, nil }
+func (_ *Float) Size() int            { return 9 }
+func (_ *Float) IsLogical() bool      { return false }
+func (_ *Float) IsAndOnly() bool      { return true }
+func (_ *Float) Attributes() []string { return []string{} }

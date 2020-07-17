@@ -6,8 +6,9 @@ type Extend interface {
 	String() string
 	IsAndOnly() bool
 	IsLogical() bool
+	ReturnType() uint32
 	Attributes() []string
-	Eval(map[string]value.Value) (value.Value, error)
+	Eval(map[string]value.Values) (value.Values, uint32, error)
 }
 
 type UnaryExtend struct {
@@ -30,5 +31,6 @@ type ParenExtend struct {
 }
 
 type Attribute struct {
+	Type uint32
 	Name string
 }

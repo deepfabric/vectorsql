@@ -1,18 +1,20 @@
 package overload
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"math"
-	"regexp"
+	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/deepfabric/vectorsql/pkg/lru"
+	"github.com/deepfabric/vectorsql/pkg/match"
 	"github.com/deepfabric/vectorsql/pkg/vm/types"
-	"github.com/deepfabric/vectorsql/pkg/vm/util/arith"
 	"github.com/deepfabric/vectorsql/pkg/vm/value"
+	"github.com/deepfabric/vectorsql/pkg/vm/value/dynamic"
+	"github.com/deepfabric/vectorsql/pkg/vm/value/static"
+	"github.com/pilosa/pilosa/roaring"
 )
 
 func IsLogical(op int) bool {
@@ -24,6 +26,8 @@ func IsLogical(op int) bool {
 	case And:
 		return true
 	case Like, NotLike:
+		return true
+	case Match, NotMatch:
 		return true
 	case EQ, LT, GT, LE, GE, NE:
 		return true
@@ -86,224 +90,1382 @@ func OperatorType(op int) int {
 		return Binary
 	case Like, NotLike:
 		return Binary
+	case Match, NotMatch:
+		return Binary
 	case Concat:
-		return Multi
+		return Binary
 	}
 	return -1
 }
 
-func UnaryEval(op int, v value.Value) (value.Value, error) {
+func UnaryEval(op int, typ uint32, vs value.Values) (value.Values, uint32, error) {
 	if os, ok := UnaryOps[op]; ok {
 		for _, o := range os {
-			if o.Typ.Oid == types.T_any || v.ResolvedType().Oid == o.Typ.Oid {
-				return o.Fn(v)
+			if unaryCheck(op, o.Typ, typ) {
+				rs, err := o.Fn(vs)
+				return rs, o.ReturnType, err
 			}
 		}
 	}
-	return nil, fmt.Errorf("%s not yet implemented for %s", OpName[op], v)
+	return nil, 0, fmt.Errorf("%s not yet implemented for %s", OpName[op], types.T(typ))
 }
 
-func BinaryEval(op int, left, right value.Value) (value.Value, error) {
+func BinaryEval(op int, ltyp, rtyp uint32, as, bs value.Values) (value.Values, uint32, error) {
 	if os, ok := BinOps[op]; ok {
 		for _, o := range os {
-			if (o.LeftType.Oid == types.T_any || left.ResolvedType().Oid == o.LeftType.Oid) &&
-				(o.RightType.Oid == types.T_any || right.ResolvedType().Oid == o.RightType.Oid) {
-				return o.Fn(left, right)
+			if binaryCheck(op, o.LeftType, o.RightType, ltyp, rtyp) {
+				rs, err := o.Fn(as, bs)
+				return rs, o.ReturnType, err
 			}
 		}
 	}
-	return nil, fmt.Errorf("%s not yet implemented for %s, %s", OpName[op], left, right)
+	return nil, 0, fmt.Errorf("%s not yet implemented for %s, %s", OpName[op], types.T(ltyp), types.T(rtyp))
 }
 
-func MultiEval(op int, args []value.Value) (value.Value, error) {
+func MultiEval(op int, typ uint32, vs []value.Values) (value.Values, uint32, error) {
 	if os, ok := MultiOps[op]; ok {
 		for _, o := range os {
-			if n := len(args); n >= o.Min || (o.Max == -1 || n <= o.Max) {
-				if n == 0 || n > 0 && (o.Typ.Oid == types.T_any || args[0].ResolvedType().Oid == o.Typ.Oid) {
-					return o.Fn(args)
+			if n := vs[0].Count(); n >= o.Min && (o.Max == -1 || n <= o.Max) {
+				if multiCheck(op, o.Typ, typ) {
+					rs, err := o.Fn(vs)
+					return rs, o.ReturnType, err
 				}
 			}
 		}
 	}
-	return nil, fmt.Errorf("%s not yet implemented for %s", OpName[op], value.Array(args))
+	return nil, 0, fmt.Errorf("%s not yet implemented for %s", OpName[op], types.T(typ))
+}
+
+func unaryCheck(op int, arg uint32, val uint32) bool {
+	switch op {
+	case Typeof:
+		return true
+	}
+	return arg == val
+}
+
+func binaryCheck(op int, arg0, arg1 uint32, val0, val1 uint32) bool {
+	return arg0 == val0 && arg1 == val1
+}
+
+func multiCheck(op int, arg uint32, val uint32) bool {
+	return false
 }
 
 var (
-	// ErrIntOutOfRange is reported when integer arithmetic overflows.
-	ErrIntOutOfRange = errors.New("integer out of range")
-
-	// ErrDivByZero is reported on a division by zero.
-	ErrDivByZero = errors.New("division by zero")
-	// ErrZeroModulus is reported when computing the rest of a division by zero.
-	ErrZeroModulus   = errors.New("zero modulus")
-	errAbsOfMinInt64 = errors.New("abs of min integer value (-9223372036854775808) not defined")
+	ErrDivByZero   = errors.New("division by zero")
+	ErrZeroModulus = errors.New("zero modulus")
 )
 
 var UnaryOps = map[int][]*UnaryOp{
 	UnaryMinus: {
 		&UnaryOp{
-			Typ:        types.Int,
-			ReturnType: types.Int,
-			Fn: func(v value.Value) (value.Value, error) {
-				i := value.MustBeInt(v)
-				if i == math.MinInt64 {
-					return nil, ErrIntOutOfRange
+			Typ:        types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
 				}
-				return value.NewInt(-i), nil
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = -a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = -v
+					}
+				}
+				return r, nil
 			},
 		},
 		&UnaryOp{
-			Typ:        types.Float,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewFloat(-value.MustBeFloat(v)), nil
+			Typ:        types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = -a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = -v
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = -a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = -v
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = -a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = -v
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = -a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = -v
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = -a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = -v
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = -a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = -v
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = -a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = -v
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Abs: {
 		&UnaryOp{
-			Typ:        types.Int,
-			ReturnType: types.Int,
-			Fn: func(v value.Value) (value.Value, error) {
-				x := value.MustBeInt(v)
-				switch {
-				case x == math.MinInt64:
-					return nil, errAbsOfMinInt64
-				case x < 0:
-					return value.NewInt(-x), nil
+			Typ:        types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int64
+
+				a := vs.(*static.Ints)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
 				}
-				return v, nil
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -y
+						} else {
+							r.Vs[o] = y
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -v
+						} else {
+							r.Vs[i] = v
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 		&UnaryOp{
-			Typ:        types.Float,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewFloat(math.Abs(value.MustBeFloat(v))), nil
+			Typ:        types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int8
+
+				a := vs.(*static.Int8s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -y
+						} else {
+							r.Vs[o] = y
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -v
+						} else {
+							r.Vs[i] = v
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int16
+
+				a := vs.(*static.Int16s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -y
+						} else {
+							r.Vs[o] = y
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -v
+						} else {
+							r.Vs[i] = v
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int32
+
+				a := vs.(*static.Int32s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -y
+						} else {
+							r.Vs[o] = y
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -v
+						} else {
+							r.Vs[i] = v
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int64
+
+				a := vs.(*static.Int64s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -y
+						} else {
+							r.Vs[o] = y
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -v
+						} else {
+							r.Vs[i] = v
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y float64
+
+				a := vs.(*static.Floats)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -y
+						} else {
+							r.Vs[o] = y
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -v
+						} else {
+							r.Vs[i] = v
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y float32
+
+				a := vs.(*static.Float32s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -y
+						} else {
+							r.Vs[o] = y
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -v
+						} else {
+							r.Vs[i] = v
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y float64
+
+				a := vs.(*static.Float64s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -y
+						} else {
+							r.Vs[o] = y
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -v
+						} else {
+							r.Vs[i] = v
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Not: {
 		&UnaryOp{
-			Typ:        types.Bool,
-			ReturnType: types.Bool,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewBool(!value.MustBeBool(v)), nil
+			Typ:        types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = !a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = !v
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Ceil: {
 		&UnaryOp{
-			Typ:        types.Int,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewFloat(float64(value.MustBeInt(v))), nil
+			Typ:        types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = math.Ceil(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = math.Ceil(v)
+					}
+				}
+				return r, nil
 			},
 		},
 		&UnaryOp{
-			Typ:        types.Float,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewFloat(math.Ceil(value.MustBeFloat(v))), nil
+			Typ:        types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(math.Ceil(float64(a.Vs[o])))
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(math.Ceil(float64(v)))
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = math.Ceil(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = math.Ceil(v)
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Sign: {
 		&UnaryOp{
-			Typ:        types.Float,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				x := value.MustBeFloat(v)
-				switch {
-				case x < 0.0:
-					return value.NewFloat(-1.0), nil
-				case x == 0.0:
-					return value.NewFloat(0.0), nil
+			Typ:        types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int64
+
+				a := vs.(*static.Ints)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
 				}
-				return value.NewFloat(1.0), nil
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -1
+						} else {
+							r.Vs[o] = 1
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -1
+						} else {
+							r.Vs[i] = 1
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 		&UnaryOp{
-			Typ:        types.Int,
-			ReturnType: types.Int,
-			Fn: func(v value.Value) (value.Value, error) {
-				x := value.MustBeInt(v)
-				switch {
-				case x < 0:
-					return value.NewInt(-1), nil
-				case x == 0:
-					return value.NewInt(0), nil
+			Typ:        types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int8
+
+				a := vs.(*static.Int8s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
 				}
-				return value.NewInt(1), nil
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -1
+						} else {
+							r.Vs[o] = 1
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -1
+						} else {
+							r.Vs[i] = 1
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int16
+
+				a := vs.(*static.Int16s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -1
+						} else {
+							r.Vs[o] = 1
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -1
+						} else {
+							r.Vs[i] = 1
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int32
+
+				a := vs.(*static.Int32s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -1
+						} else {
+							r.Vs[o] = 1
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -1
+						} else {
+							r.Vs[i] = 1
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y int64
+
+				a := vs.(*static.Int64s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -1
+						} else {
+							r.Vs[o] = 1
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -1
+						} else {
+							r.Vs[i] = 1
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y float64
+
+				a := vs.(*static.Floats)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -1.0
+						} else {
+							r.Vs[o] = 1.0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -1.0
+						} else {
+							r.Vs[i] = 1.0
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y float32
+
+				a := vs.(*static.Float32s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -1.0
+						} else {
+							r.Vs[o] = 1.0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -1.0
+						} else {
+							r.Vs[i] = 1.0
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				var y float64
+
+				a := vs.(*static.Float64s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if y = a.Vs[o]; y < 0 {
+							r.Vs[o] = -1.0
+						} else {
+							r.Vs[o] = 1.0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v < 0 {
+							r.Vs[i] = -1.0
+						} else {
+							r.Vs[i] = 1.0
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Floor: {
 		&UnaryOp{
-			Typ:        types.Int,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewFloat(float64(value.MustBeInt(v))), nil
+			Typ:        types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = math.Floor(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = math.Floor(v)
+					}
+				}
+				return r, nil
 			},
 		},
 		&UnaryOp{
-			Typ:        types.Float,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewFloat(math.Floor(value.MustBeFloat(v))), nil
+			Typ:        types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(math.Floor(float64(a.Vs[o])))
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(math.Floor(float64(v)))
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = math.Floor(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = math.Floor(v)
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Lower: {
 		&UnaryOp{
-			Typ:        types.String,
-			ReturnType: types.String,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewString(strings.ToLower(value.MustBeString(v))), nil
+			Typ:        types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strings.ToLower(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strings.ToLower(v)
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Round: {
 		&UnaryOp{
-			Typ:        types.Int,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewFloat(float64(value.MustBeInt(v))), nil
+			Typ:        types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = math.RoundToEven(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = math.RoundToEven(v)
+					}
+				}
+				return r, nil
 			},
 		},
 		&UnaryOp{
-			Typ:        types.Float,
-			ReturnType: types.Float,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewFloat(math.RoundToEven(value.MustBeFloat(v))), nil
+			Typ:        types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(math.RoundToEven(float64(a.Vs[o])))
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(math.RoundToEven(float64(v)))
+					}
+				}
+				return r, nil
+			},
+		},
+		&UnaryOp{
+			Typ:        types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = math.RoundToEven(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = math.RoundToEven(v)
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Upper: {
 		&UnaryOp{
-			Typ:        types.String,
-			ReturnType: types.String,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewString(strings.ToUpper(value.MustBeString(v))), nil
+			Typ:        types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strings.ToUpper(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strings.ToUpper(v)
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Length: {
 		&UnaryOp{
-			Typ:        types.String,
-			ReturnType: types.Int,
-			Fn: func(v value.Value) (value.Value, error) {
-				n := utf8.RuneCountInString(value.MustBeString(v))
-				return value.NewInt(int64(n)), nil
+			Typ:        types.T_string,
+			ReturnType: types.T_int,
+			Fn: func(vs value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(len(a.Vs[o]))
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(len(v))
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Typeof: {
 		&UnaryOp{
-			Typ:        types.Any,
-			ReturnType: types.String,
-			Fn: func(v value.Value) (value.Value, error) {
-				return value.NewString(strings.ToLower(v.ResolvedType().String())), nil
+			ReturnType: types.T_string,
+			Fn: func(vs value.Values) (value.Values, error) {
+				switch t := vs.(type) {
+				case *static.Ints:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_int).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Int8s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_int8).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Int16s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_int16).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Int32s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_int32).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Int64s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_int64).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Uint8s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_uint8).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Uint16s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_uint16).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Uint32s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_uint32).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Uint64s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_uint64).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Bools:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_bool).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Timestamps:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_timestamp).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Floats:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_float).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Float32s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_float32).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *static.Float64s:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_float64).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				case *dynamic.Strings:
+					r := &dynamic.Strings{
+						Np: t.Np,
+						Dp: t.Dp,
+						Is: t.Is,
+						Vs: make([]string, len(t.Vs)),
+					}
+					ts := strings.ToLower(types.T(types.T_string).String())
+					if len(r.Is) > 0 {
+						for _, o := range r.Is {
+							r.Vs[o] = ts
+						}
+					} else {
+						for i := range r.Vs {
+							r.Vs[i] = ts
+						}
+					}
+					return r, nil
+				}
+				return nil, nil
 			},
 		},
 	},
@@ -313,523 +1475,25212 @@ var UnaryOps = map[int][]*UnaryOp{
 var BinOps = map[int][]*BinOp{
 	Or: {
 		&BinOp{
-			LeftType:   types.Bool,
-			RightType:  types.Bool,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeBool(left), value.MustBeBool(right)
-				return value.NewBool(a || b), nil
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] || b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v || b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	And: {
 		&BinOp{
-			LeftType:   types.Bool,
-			RightType:  types.Bool,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeBool(left), value.MustBeBool(right)
-				return value.NewBool(a && b), nil
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] && b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v && b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Plus: {
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Int,
-			ReturnType: types.Int,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeInt(right)
-				r, ok := arith.AddWithOverflow(int64(a), int64(b))
-				if !ok {
-					return nil, ErrIntOutOfRange
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Ints{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
 				}
-				return value.NewInt(r), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeFloat(right)
-				return value.NewFloat(a + b), nil
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeFloat(right)
-				return value.NewFloat(float64(a) + b), nil
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Int,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeInt(right)
-				return value.NewFloat(a + float64(b)), nil
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Time,
-			RightType:  types.Int,
-			ReturnType: types.Time,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeTime(left), value.MustBeInt(right)
-				return value.NewTime(a.Add(time.Duration(b))), nil
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Time,
-			ReturnType: types.Time,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeTime(right)
-				return value.NewTime(b.Add(time.Duration(a))), nil
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Floats{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
-
 	Minus: {
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Int,
-			ReturnType: types.Int,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeInt(right)
-				r, ok := arith.SubWithOverflow(int64(a), int64(b))
-				if !ok {
-					return nil, ErrIntOutOfRange
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Ints{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
 				}
-				return value.NewInt(r), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeFloat(right)
-				return value.NewFloat(a - b), nil
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeFloat(right)
-				return value.NewFloat(float64(a) - b), nil
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Int,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeInt(right)
-				return value.NewFloat(a - float64(b)), nil
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Time,
-			RightType:  types.Time,
-			ReturnType: types.Int,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeTime(left), value.MustBeTime(right)
-				return value.NewInt(int64(a.Sub(b))), nil
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Floats{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] - b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v - b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
-
 	Mult: {
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Int,
-			ReturnType: types.Int,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				// See Rob Pike's implementation from
-				// https://groups.google.com/d/msg/golang-nuts/h5oSN5t3Au4/KaNQREhZh0QJ
-
-				a, b := value.MustBeInt(left), value.MustBeInt(right)
-				c := a * b
-				if a == 0 || b == 0 || a == 1 || b == 1 {
-					// ignore
-				} else if a == math.MinInt64 || b == math.MinInt64 {
-					// This test is required to detect math.MinInt64 * -1.
-					return nil, ErrIntOutOfRange
-				} else if c/b != a {
-					return nil, ErrIntOutOfRange
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Ints{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
 				}
-				return value.NewInt(c), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeFloat(right)
-				return value.NewFloat(a * b), nil
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeFloat(right)
-				return value.NewFloat(float64(a) * b), nil
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Int,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeInt(right)
-				return value.NewFloat(a * float64(b)), nil
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Floats{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] * b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v * b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
-
 	Div: {
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Int,
-			ReturnType: types.Int,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeInt(right)
-				if b == 0 {
-					return nil, ErrDivByZero
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Ints{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
 				}
-				return value.NewInt(a / b), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeFloat(right)
-				if b == 0 {
-					return nil, ErrDivByZero
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
 				}
-				return value.NewFloat(a / b), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int8
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int8
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeFloat(right)
-				if b == 0 {
-					return nil, ErrDivByZero
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
 				}
-				return value.NewFloat(float64(a) / b), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int16
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int16
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !!fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Int,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeInt(right)
-				if b == 0 {
-					return nil, ErrDivByZero
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
 				}
-				return value.NewFloat(a / float64(b)), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint8
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w uint8
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint16
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w uint16
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w uint32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w uint64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int8
+
+					for _, o := range r.Is {
+						v = int8(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int8
+
+					for i, v := range a.Vs {
+						w = int8(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int8
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = int8(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = int8(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w int8
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = int8(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = int8(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int16
+
+					for _, o := range r.Is {
+						v = int16(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int16
+
+					for i, v := range a.Vs {
+						w = int16(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int16
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = int16(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = int16(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w int16
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = int16(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = int16(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int32
+
+					for _, o := range r.Is {
+						v = int32(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int32
+
+					for i, v := range a.Vs {
+						w = int32(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = int32(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = int32(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w int32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = int32(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = int32(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int64
+
+					for _, o := range r.Is {
+						v = int64(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w int64
+
+					for i, v := range a.Vs {
+						w = int64(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = int64(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = int64(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w int64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = int64(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = int64(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint8
+
+					for _, o := range r.Is {
+						v = uint8(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w uint8
+
+					for i, v := range a.Vs {
+						w = uint8(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint8
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = uint8(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = uint8(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w uint8
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = uint8(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = uint8(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint16
+
+					for _, o := range r.Is {
+						v = uint16(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w uint16
+
+					for i, v := range a.Vs {
+						w = uint16(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint16
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = uint16(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = uint16(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w uint16
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = uint16(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = uint16(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint32
+
+					for _, o := range r.Is {
+						v = uint32(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w uint32
+
+					for i, v := range a.Vs {
+						w = uint32(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = uint32(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = uint32(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w uint32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = uint32(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = uint32(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint64
+
+					for _, o := range r.Is {
+						v = uint64(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w uint64
+
+					for i, v := range a.Vs {
+						w = uint64(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = uint64(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = uint64(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w uint64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = uint64(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = uint64(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Floats{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w float64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w float32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w float64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float32
+
+					for _, o := range r.Is {
+						v = float32(b.Vs[o])
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w float32
+
+					for i, v := range a.Vs {
+						w = float32(b.Vs[i])
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = float32(a.Vs[o]) / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = float32(a.Vs[o]) / v
+							}
+						}
+					}
+				} else {
+					var w float32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = float32(v) / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = float32(v) / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w float64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[o] = a.Vs[o] / v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[o] = a.Vs[o] / v
+							}
+						}
+					}
+				} else {
+					var w float64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrDivByZero
+							}
+							r.Vs[i] = v / w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrDivByZero
+								}
+								r.Vs[i] = v / w
+							}
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 	},
-
 	Mod: {
 		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Int,
-			ReturnType: types.Int,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeInt(right)
-				if b == 0 {
-					return nil, ErrZeroModulus
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Ints{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
 				}
-				return value.NewInt(a % b), nil
-			},
-		},
-		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeFloat(right)
-				return value.NewFloat(math.Mod(a, b)), nil
-			},
-		},
-		&BinOp{
-			LeftType:   types.Int,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeInt(left), value.MustBeFloat(right)
-				return value.NewFloat(math.Mod(float64(a), b)), nil
-			},
-		},
-		&BinOp{
-			LeftType:   types.Float,
-			RightType:  types.Int,
-			ReturnType: types.Float,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				a, b := value.MustBeFloat(left), value.MustBeInt(right)
-				return value.NewFloat(math.Mod(a, float64(b))), nil
-			},
-		},
-	},
-	Typecast: {
-		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Uint8,
-			ReturnType: types.Uint8,
-			Fn: func(v, _ value.Value) (value.Value, error) {
-				switch v.ResolvedType().Oid {
-				case types.T_int:
-					return value.NewUint8(uint8(value.MustBeInt(v) & 0xFF)), nil
-				case types.T_uint8:
-					return v, nil
-				case types.T_bool:
-					if value.MustBeBool(v) {
-						return value.NewUint8(1), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
 					}
-					return value.NewUint8(0), nil
-				case types.T_time:
-					return value.NewUint8(uint8(value.MustBeTime(v).Unix() & 0xFF)), nil
-				case types.T_float:
-					f := value.MustBeFloat(v)
-					if math.IsNaN(f) || f <= float64(math.MinInt64) || f >= float64(math.MaxInt64) {
-						return nil, ErrIntOutOfRange
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
 					}
-					return value.NewUint8(uint8(f)), nil
-				case types.T_string:
-					return value.ParseUint8(value.MustBeString(v))
 				}
-				return value.ConstNull, fmt.Errorf("cannot convert type %s to type %s", v.ResolvedType(), types.Uint8)
-			},
-		},
-		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Int,
-			ReturnType: types.Int,
-			Fn: func(v, _ value.Value) (value.Value, error) {
-				switch v.ResolvedType().Oid {
-				case types.T_int:
-					return v, nil
-				case types.T_uint8:
-					return value.NewInt(int64(value.MustBeUint8(v))), nil
-				case types.T_bool:
-					if value.MustBeBool(v) {
-						return value.NewInt(1), nil
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
 					}
-					return value.NewInt(0), nil
-				case types.T_time:
-					return value.NewInt(value.MustBeTime(v).Unix()), nil
-				case types.T_float:
-					f := value.MustBeFloat(v)
-					if math.IsNaN(f) || f <= float64(math.MinInt64) || f >= float64(math.MaxInt64) {
-						return nil, ErrIntOutOfRange
+				} else {
+					var w int64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
 					}
-					return value.NewInt(int64(f)), nil
-				case types.T_string:
-					return value.ParseInt(value.MustBeString(v))
 				}
-				return value.ConstNull, fmt.Errorf("cannot convert type %s to type %s", v.ResolvedType(), types.Int)
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Bool,
-			ReturnType: types.Bool,
-			Fn: func(v, _ value.Value) (value.Value, error) {
-				switch v.ResolvedType().Oid {
-				case types.T_int:
-					return value.NewBool(value.MustBeInt(v) != 0), nil
-				case types.T_uint8:
-					return value.NewBool(value.MustBeUint8(v) != 0), nil
-				case types.T_bool:
-					return v, nil
-				case types.T_float:
-					return value.NewBool(value.MustBeFloat(v) != 0), nil
-				case types.T_string:
-					return value.ParseBool(value.MustBeString(v))
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
 				}
-				return value.ConstNull, fmt.Errorf("cannot convert type %s to type %s", v.ResolvedType(), types.Bool)
-			},
-		},
-		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Time,
-			ReturnType: types.Time,
-			Fn: func(v, _ value.Value) (value.Value, error) {
-				switch v.ResolvedType().Oid {
-				case types.T_int:
-					return value.NewTime(time.Unix(value.MustBeInt(v), 0)), nil
-				case types.T_time:
-					return v, nil
-				case types.T_float:
-					return value.NewTime(time.Unix(int64(value.MustBeFloat(v)), 0)), nil
-				case types.T_string:
-					return value.ParseTime(value.MustBeString(v))
-				}
-				return value.ConstNull, fmt.Errorf("cannot convert type %s to type %s", v.ResolvedType(), types.Time)
-			},
-		},
-		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Float,
-			ReturnType: types.Float,
-			Fn: func(v, _ value.Value) (value.Value, error) {
-				switch v.ResolvedType().Oid {
-				case types.T_int:
-					return value.NewFloat(float64(value.MustBeInt(v))), nil
-				case types.T_uint8:
-					return value.NewFloat(float64(value.MustBeUint8(v))), nil
-				case types.T_bool:
-					if value.MustBeBool(v) {
-						return value.NewFloat(1), nil
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
 					}
-					return value.NewFloat(0), nil
-				case types.T_time:
-					return value.NewFloat(float64(value.MustBeTime(v).Unix())), nil
-				case types.T_float:
-					return v, nil
-				case types.T_string:
-					return value.ParseFloat(value.MustBeString(v))
 				}
-				return value.ConstNull, fmt.Errorf("cannot convert type %s to type %s", v.ResolvedType(), types.Float)
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int8
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w int8
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.String,
-			ReturnType: types.String,
-			Fn: func(v, _ value.Value) (value.Value, error) {
-				return value.NewString(v.String()), nil
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int16
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w int16
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w int32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w int64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint8
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w uint8
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint16
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w uint16
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w uint32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w uint64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int8
+
+					for _, o := range r.Is {
+						v = int8(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w int8
+
+					for i, v := range a.Vs {
+						w = int8(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Int8s{
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int8
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = int8(a.Vs[o]) % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = int8(a.Vs[o]) % v
+							}
+						}
+					}
+				} else {
+					var w int8
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = int8(v) % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = int8(v) % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int16
+
+					for _, o := range r.Is {
+						v = int16(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w int16
+
+					for i, v := range a.Vs {
+						w = int16(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Int16s{
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int16
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = int16(a.Vs[o]) % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = int16(a.Vs[o]) % v
+							}
+						}
+					}
+				} else {
+					var w int16
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = int16(v) % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = int16(v) % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int32
+
+					for _, o := range r.Is {
+						v = int32(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w int32
+
+					for i, v := range a.Vs {
+						w = int32(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Int32s{
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = int32(a.Vs[o]) % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = int32(a.Vs[o]) % v
+							}
+						}
+					}
+				} else {
+					var w int32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = int32(v) % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = int32(v) % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int64
+
+					for _, o := range r.Is {
+						v = int64(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w int64
+
+					for i, v := range a.Vs {
+						w = int64(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Int64s{
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v int64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = int64(a.Vs[o]) % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = int64(a.Vs[o]) % v
+							}
+						}
+					}
+				} else {
+					var w int64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = int64(v) % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = int64(v) % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint8
+
+					for _, o := range r.Is {
+						v = uint8(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w uint8
+
+					for i, v := range a.Vs {
+						w = uint8(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Uint8s{
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint8
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = uint8(a.Vs[o]) % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = uint8(a.Vs[o]) % v
+							}
+						}
+					}
+				} else {
+					var w uint8
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = uint8(v) % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = uint8(v) % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint16
+
+					for _, o := range r.Is {
+						v = uint16(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w uint16
+
+					for i, v := range a.Vs {
+						w = uint16(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint16
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = uint16(a.Vs[o]) % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = uint16(a.Vs[o]) % v
+							}
+						}
+					}
+				} else {
+					var w uint16
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = uint16(v) % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = uint16(v) % w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint32
+
+					for _, o := range r.Is {
+						v = uint32(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w uint32
+
+					for i, v := range a.Vs {
+						w = uint32(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Uint32s{
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = uint32(a.Vs[o]) % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = uint32(a.Vs[o]) % v
+							}
+						}
+					}
+				} else {
+					var w uint32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = uint32(v) % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = uint32(v) % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint64
+
+					for _, o := range r.Is {
+						v = uint64(b.Vs[o])
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = a.Vs[o] % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = a.Vs[o] % v
+							}
+						}
+					}
+				} else {
+					var w uint64
+
+					for i, v := range a.Vs {
+						w = uint64(b.Vs[i])
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = v % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = v % w
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Uint64s{
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v uint64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = uint64(a.Vs[o]) % v
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = uint64(a.Vs[o]) % v
+							}
+						}
+					}
+				} else {
+					var w uint64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = uint64(v) % w
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = uint64(v) % b.Vs[i]
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Floats{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = math.Mod(a.Vs[o], v)
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = math.Mod(a.Vs[o], v)
+							}
+						}
+					}
+				} else {
+					var w float64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = math.Mod(v, w)
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = math.Mod(v, b.Vs[i])
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = float32(math.Mod(float64(a.Vs[o]), float64(v)))
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = float32(math.Mod(float64(a.Vs[o]), float64(v)))
+							}
+						}
+					}
+				} else {
+					var w float32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = float32(math.Mod(float64(v), float64(w)))
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = float32(math.Mod(float64(v), float64(w)))
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = math.Mod(a.Vs[o], v)
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = math.Mod(a.Vs[o], v)
+							}
+						}
+					}
+				} else {
+					var w float64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = math.Mod(v, w)
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = math.Mod(v, b.Vs[i])
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float32
+
+					for _, o := range r.Is {
+						v = float32(b.Vs[o])
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = float32(math.Mod(float64(a.Vs[o]), float64(v)))
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = float32(math.Mod(float64(a.Vs[o]), float64(v)))
+							}
+						}
+					}
+				} else {
+					var w float32
+
+					for i, v := range a.Vs {
+						w = float32(b.Vs[i])
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = float32(math.Mod(float64(v), float64(w)))
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = float32(math.Mod(float64(v), float64(w)))
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Float32s{
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float32
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = float32(math.Mod(a.Vs[o], float64(v)))
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = float32(math.Mod(a.Vs[o], float64(v)))
+							}
+						}
+					}
+				} else {
+					var w float32
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = float32(math.Mod(v, float64(w)))
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = float32(math.Mod(v, float64(w)))
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = math.Mod(a.Vs[o], v)
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = math.Mod(a.Vs[o], v)
+							}
+						}
+					}
+				} else {
+					var w float64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = math.Mod(v, w)
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = math.Mod(v, b.Vs[i])
+							}
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Float64s{
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				var fp *roaring.Bitmap
+				switch {
+				case r.Dp == nil && r.Np != nil:
+					fp = r.Np
+				case r.Dp != nil && r.Np == nil:
+					fp = r.Dp
+				case r.Dp != nil && r.Np != nil:
+					fp = r.Np.Union(r.Dp)
+				}
+				if len(r.Is) > 0 {
+					var v float64
+
+					for _, o := range r.Is {
+						v = b.Vs[o]
+						if fp == nil {
+							if v == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[o] = math.Mod(a.Vs[o], v)
+						} else {
+							if !fp.Contains(o) {
+								if v == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[o] = math.Mod(a.Vs[o], v)
+							}
+						}
+					}
+				} else {
+					var w float64
+
+					for i, v := range a.Vs {
+						w = b.Vs[i]
+						if fp == nil {
+							if w == 0.0 {
+								return nil, ErrZeroModulus
+							}
+							r.Vs[i] = math.Mod(v, w)
+						} else {
+							if !fp.Contains(uint64(i)) {
+								if w == 0 {
+									return nil, ErrZeroModulus
+								}
+								r.Vs[i] = math.Mod(v, w)
+							}
+						}
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	EQ: {
 		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Any,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				return value.NewBool(value.Compare(left, right) == 0), nil
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Timestamps), bs.(*static.Timestamps)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	LT: {
 		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Any,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				return value.NewBool(value.Compare(left, right) < 0), nil
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = !a.Vs[o] && b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = !v && b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Timestamps), bs.(*static.Timestamps)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) < 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] < b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v < b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	GT: {
 		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Any,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				return value.NewBool(value.Compare(left, right) > 0), nil
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] && !b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v && !b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Timestamps), bs.(*static.Timestamps)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] > b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v > b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	LE: {
 		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Any,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				return value.NewBool(value.Compare(left, right) <= 0), nil
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o] || (!a.Vs[o] && b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i] || (!v && b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Timestamps), bs.(*static.Timestamps)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) <= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] <= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v <= b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	GE: {
 		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Any,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				return value.NewBool(value.Compare(left, right) >= 0), nil
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] && !b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v && !b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Timestamps), bs.(*static.Timestamps)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] == b.Vs[o] && (a.Vs[o] && !b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v == b.Vs[i] && (v && !b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Timestamps), bs.(*static.Timestamps)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) >= 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] >= b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v >= b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	NE: {
 		&BinOp{
-			LeftType:   types.Any,
-			RightType:  types.Any,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				return value.NewBool(value.Compare(left, right) != 0), nil
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != int8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != int8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o]) != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v) != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != int16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != int16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o]) != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v) != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int32,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != int32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != int32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o]) != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v) != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Int64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Int64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint8s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != uint8(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != uint8(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint8s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o]) != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v) != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint16s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != uint16(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != uint16(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint16s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o]) != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v) != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint32s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != uint32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != uint32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o]) != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v) != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Uint64s), bs.(*static.Ints)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != uint64(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != uint64(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Ints), bs.(*static.Uint64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o]) != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v) != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float32s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != float32(b.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != float32(b.Vs[i])
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float32s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o]) != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v) != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Float64s), bs.(*static.Floats)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Floats), bs.(*static.Float64s)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Bools), bs.(*static.Bools)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*static.Timestamps), bs.(*static.Timestamps)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) != 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] != b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v != b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	Like: {
 		&BinOp{
-			LeftType:   types.String,
-			RightType:  types.String,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				rgp, err := regexp.Compile(value.MustBeString(right))
-				if err != nil {
-					return nil, err
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
 				}
-				return value.NewBool(rgp.MatchString(value.MustBeString(left))), nil
+				m := match.New(lru.New(1 << 10))
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rgp, err := m.Compile(b.Vs[o], true)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = rgp.MatchString(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						rgp, err := m.Compile(b.Vs[i], true)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = rgp.MatchString(v)
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 	NotLike: {
 		&BinOp{
-			LeftType:   types.String,
-			RightType:  types.String,
-			ReturnType: types.Bool,
-			Fn: func(left, right value.Value) (value.Value, error) {
-				rgp, err := regexp.Compile("!" + value.MustBeString(right))
-				if err != nil {
-					return nil, err
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
 				}
-				return value.NewBool(rgp.MatchString(value.MustBeString(left))), nil
-			},
-		},
-	},
-}
-
-var MultiOps = map[int][]*MultiOp{
-	// concat concatenates the text representations of all the arguments.
-	// NULL and Table arguments are ignored.
-	Concat: {
-		&MultiOp{
-			Min:        1,
-			Max:        -1,
-			Typ:        types.String,
-			ReturnType: types.String,
-			Fn: func(args []value.Value) (value.Value, error) {
-				var buffer bytes.Buffer
-
-				for _, arg := range args {
-					if oid := arg.ResolvedType().Oid; oid == types.T_null {
-						continue
+				m := match.New(lru.New(1 << 10))
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rgp, err := m.Compile(b.Vs[o], true)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = !rgp.MatchString(a.Vs[o])
 					}
-					buffer.WriteString(value.MustBeString(arg))
+				} else {
+					for i, v := range a.Vs {
+						rgp, err := m.Compile(b.Vs[i], true)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = !rgp.MatchString(v)
+					}
 				}
-				return value.NewString(buffer.String()), nil
+				return r, nil
+			},
+		},
+	},
+	Match: {
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				m := match.New(lru.New(1 << 10))
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rgp, err := m.Compile(b.Vs[o], false)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = rgp.MatchString(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						rgp, err := m.Compile(b.Vs[i], false)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = rgp.MatchString(v)
+					}
+				}
+				return r, nil
+			},
+		},
+	},
+	NotMatch: {
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_bool,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &static.Bools{
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				m := match.New(lru.New(1 << 10))
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rgp, err := m.Compile(b.Vs[o], false)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = !rgp.MatchString(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						rgp, err := m.Compile(b.Vs[i], false)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = !rgp.MatchString(v)
+					}
+				}
+				return r, nil
+			},
+		},
+	},
+	Typecast: {
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o]
+					}
+				} else {
+					copy(r.Vs, a.Vs)
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_int,
+			ReturnType: types.T_int,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Ints{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = rv
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = rv
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Int8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 8)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = int8(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 8)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = int8(rv)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_int16,
+			ReturnType: types.T_int16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Int16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 16)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = int16(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 16)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = int16(rv)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_int32,
+			ReturnType: types.T_int32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Int32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 32)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = int32(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 32)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = int32(rv)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o]
+					}
+				} else {
+					copy(r.Vs, a.Vs)
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_int64,
+			ReturnType: types.T_int64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Int64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = int64(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = int64(rv)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_int8,
+			ReturnType: types.T_int8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint8(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint8(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_uint8,
+			ReturnType: types.T_uint8,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Uint8s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint8, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 8)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = uint8(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 8)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = uint8(rv)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint16(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint16(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_uint16,
+			ReturnType: types.T_uint16,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Uint16s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint16, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 16)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = uint16(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 16)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = uint16(rv)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint32(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_uint32,
+			ReturnType: types.T_uint32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Uint32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 32)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = uint32(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 32)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = uint32(rv)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1
+						} else {
+							r.Vs[o] = 0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1
+						} else {
+							r.Vs[i] = 0
+						}
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = uint64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = uint64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_uint64,
+			ReturnType: types.T_uint64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Uint64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]uint64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseInt(a.Vs[0], 0, 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = uint64(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseInt(v, 0, 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = uint64(rv)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0.0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0.0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0.0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0.0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] == 0.0 {
+							r.Vs[o] = false
+						} else {
+							r.Vs[o] = true
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v == 0.0 {
+							r.Vs[i] = false
+						} else {
+							r.Vs[i] = true
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_bool,
+			ReturnType: types.T_bool,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Bools{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]bool, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := value.ParseBool(a.Vs[o])
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = bool(*rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := value.ParseBool(v)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = bool(*rv)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1.0
+						} else {
+							r.Vs[o] = 0.0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1.0
+						} else {
+							r.Vs[i] = 0.0
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_float,
+			ReturnType: types.T_float,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseFloat(a.Vs[o], 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = rv
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseFloat(v, 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = rv
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1.0
+						} else {
+							r.Vs[o] = 0.0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1.0
+						} else {
+							r.Vs[i] = 0.0
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float32(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float32(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_float32,
+			ReturnType: types.T_float32,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Float32s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float32, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseFloat(a.Vs[o], 32)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = float32(rv)
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseFloat(v, 32)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = float32(rv)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						if a.Vs[o] {
+							r.Vs[o] = 1.0
+						} else {
+							r.Vs[o] = 0.0
+						}
+					}
+				} else {
+					for i, v := range a.Vs {
+						if v {
+							r.Vs[i] = 1.0
+						} else {
+							r.Vs[i] = 0.0
+						}
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &static.Float64s{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = float64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = float64(v)
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_float64,
+			ReturnType: types.T_float64,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Floats{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]float64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := strconv.ParseFloat(a.Vs[o], 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = rv
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := strconv.ParseFloat(v, 64)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = rv
+					}
+				}
+				return r, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = int64(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = int64(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_timestamp,
+			ReturnType: types.T_timestamp,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*dynamic.Strings)
+				r := &static.Timestamps{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]int64, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						rv, err := time.Parse(value.TimestampOutputFormat, a.Vs[o])
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[o] = rv.Unix()
+					}
+				} else {
+					for i, v := range a.Vs {
+						rv, err := time.Parse(value.TimestampOutputFormat, v)
+						if err != nil {
+							return nil, err
+						}
+						r.Vs[i] = rv.Unix()
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Ints)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatInt(a.Vs[o], 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatInt(v, 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int8,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int8s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatInt(int64(a.Vs[o]), 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatInt(int64(v), 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int16,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int16s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatInt(int64(a.Vs[o]), 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatInt(int64(v), 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int32,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int32s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatInt(int64(a.Vs[o]), 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatInt(int64(v), 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_int64,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Int64s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatInt(a.Vs[o], 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatInt(v, 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint8,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint8s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatUint(uint64(a.Vs[o]), 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatUint(uint64(v), 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint16,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint16s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatUint(uint64(a.Vs[o]), 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatUint(uint64(v), 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint32,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint32s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatUint(uint64(a.Vs[o]), 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatUint(uint64(v), 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_uint64,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Uint64s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatUint(a.Vs[o], 10)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatUint(v, 10)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Floats)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatFloat(a.Vs[o], 'f', -1, 64)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatFloat(v, 'f', -1, 64)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float32,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float32s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatFloat(float64(a.Vs[o]), 'f', -1, 32)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatFloat(float64(v), 'f', -1, 32)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_float64,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Float64s)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatFloat(a.Vs[o], 'f', -1, 64)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatFloat(v, 'f', -1, 64)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_bool,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Bools)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = strconv.FormatBool(a.Vs[o])
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = strconv.FormatBool(v)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_timestamp,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				a := vs.(*static.Timestamps)
+				r := &dynamic.Strings{
+					Np: a.Np,
+					Dp: a.Dp,
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = time.Unix(a.Vs[o], 0).UTC().Format(value.TimestampOutputFormat)
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = time.Unix(v, 0).UTC().Format(value.TimestampOutputFormat)
+					}
+				}
+				return a, nil
+			},
+		},
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(vs, _ value.Values) (value.Values, error) {
+				return vs, nil
+			},
+		},
+	},
+	Concat: {
+		&BinOp{
+			LeftType:   types.T_string,
+			RightType:  types.T_string,
+			ReturnType: types.T_string,
+			Fn: func(as, bs value.Values) (value.Values, error) {
+				a, b := as.(*dynamic.Strings), bs.(*dynamic.Strings)
+				r := &dynamic.Strings{
+					Is: a.Is,
+					Vs: make([]string, len(a.Vs)),
+				}
+				{
+					switch {
+					case a.Np == nil && b.Np != nil:
+						r.Np = b.Np
+					case a.Np != nil && b.Np == nil:
+						r.Np = a.Np
+					case a.Np != nil && b.Np != nil:
+						r.Np = a.Np.Union(b.Np)
+					}
+				}
+				{
+					switch {
+					case a.Dp == nil && b.Dp != nil:
+						r.Dp = b.Dp
+					case a.Dp != nil && b.Dp == nil:
+						r.Dp = a.Np
+					case a.Dp != nil && b.Dp != nil:
+						r.Dp = a.Dp.Union(b.Dp)
+					}
+				}
+				if len(r.Is) > 0 {
+					for _, o := range r.Is {
+						r.Vs[o] = a.Vs[o] + b.Vs[o]
+					}
+				} else {
+					for i, v := range a.Vs {
+						r.Vs[i] = v + b.Vs[i]
+					}
+				}
+				return r, nil
 			},
 		},
 	},
 }
+
+var MultiOps = map[int][]*MultiOp{}

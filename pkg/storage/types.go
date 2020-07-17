@@ -1,52 +1,55 @@
 package storage
 
 import (
-	"errors"
 	"sync"
 
 	"github.com/deepfabric/thinkkv/pkg/engine"
-	"github.com/deepfabric/vectorsql/pkg/vm/container/relation"
-	lru "github.com/hashicorp/golang-lru"
+	"github.com/deepfabric/vectorsql/pkg/bsi"
+	"github.com/deepfabric/vectorsql/pkg/lru"
+	"github.com/deepfabric/vectorsql/pkg/storage/cache"
+	"github.com/deepfabric/vectorsql/pkg/storage/index"
+	"github.com/deepfabric/vectorsql/pkg/storage/metadata"
+	"github.com/deepfabric/vectorsql/pkg/vm/value"
+	"github.com/pilosa/pilosa/roaring"
 )
 
-var (
-	ID       = "id"
-	SEQ      = "seq" // row number
-	NotExist = errors.New("Not Exist")
+const (
+	Item  = "_item"
+	Event = "_event"
 )
 
 type Storage interface {
 	Close() error
-	NewRelation(string, MetaData) error
-	Relation(string) (relation.Relation, error)
+	Relation(string) (Relation, error)
+	NewRelation(string, metadata.Metadata) error
 }
 
-type MetaData struct {
-	IsEvent bool
-	Types   []int32  // type of attributes
-	Attrs   []string // attributes
+type Relation interface {
+	Destroy() error
+
+	IsEvent() bool
+
+	IdMap() (bsi.Bsi, error)
+
+	AddTuples([]interface{}) error
+
+	Eq(string, value.Value) (*roaring.Bitmap, error)
+	Ne(string, value.Value) (*roaring.Bitmap, error)
+	Lt(string, value.Value) (*roaring.Bitmap, error)
+	Le(string, value.Value) (*roaring.Bitmap, error)
+	Gt(string, value.Value) (*roaring.Bitmap, error)
+	Ge(string, value.Value) (*roaring.Bitmap, error)
 }
 
 type storage struct {
-	mcpu int
-	db   engine.DB
-	bc   *lru.Cache // cache for bitmap
-	rc   *lru.Cache // cache for relation
+	sync.RWMutex
+	rc lru.LRU // cache for relation
+	db engine.DB
+	lc cache.Cache
 }
 
-// M.id -> metadata
-// id.attr's name        	-> bitmap -- null bitmap
-// id.attr's name.I 		-> bitmap -- bsi, bitmap
-// id.attr's name.U 		-> bitmap -- ubsi bitmap
-// id.attr's name.value  	-> bitmap -- bool, string bitmap
-// id.attr's name.I.value  	-> bitmap -- int8 bitmap
-// id.attr's name.U.value  	-> bitmap -- uint8 bitmap
-type index struct {
+type relation struct {
 	sync.RWMutex
-	isE  bool
-	mcpu int
-	id   string // relation id
-	db   engine.DB
-	lc   *lru.Cache // cache for bitmap
-	mp   map[string]int32
+	idx index.Index
+	md  metadata.Metadata
 }

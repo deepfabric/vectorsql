@@ -1,8 +1,9 @@
 package ifilter
 
 import (
-	"github.com/deepfabric/vectorsql/pkg/vm/container/relation"
+	"github.com/deepfabric/vectorsql/pkg/storage"
 	"github.com/deepfabric/vectorsql/pkg/vm/value"
+	"github.com/pilosa/pilosa/roaring"
 )
 
 const (
@@ -14,6 +15,11 @@ const (
 	GE
 )
 
+type Filter interface {
+	String() string
+	Bitmap() (*roaring.Bitmap, error)
+}
+
 type Condition struct {
 	Op   int // eq, ne, lt, le, gt, ge
 	Name string
@@ -22,5 +28,5 @@ type Condition struct {
 
 type filter struct {
 	cs []*Condition
-	r  relation.Relation
+	r  storage.Relation
 }

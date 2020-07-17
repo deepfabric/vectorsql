@@ -2,9 +2,9 @@ package extend
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/deepfabric/vectorsql/pkg/vm/extend/overload"
+	"github.com/deepfabric/vectorsql/pkg/vm/types"
 	"github.com/deepfabric/vectorsql/pkg/vm/util"
 	"github.com/deepfabric/vectorsql/pkg/vm/value"
 )
@@ -21,12 +21,40 @@ func (e *UnaryExtend) Attributes() []string {
 	return e.E.Attributes()
 }
 
-func (e *UnaryExtend) Eval(mp map[string]value.Value) (value.Value, error) {
-	v, err := e.E.Eval(mp)
-	if err != nil {
-		return nil, err
+func (e *UnaryExtend) ReturnType() uint32 {
+	switch e.Op {
+	case overload.Not:
+		return e.E.ReturnType()
+	case overload.Abs:
+		return e.E.ReturnType()
+	case overload.Ceil:
+		return e.E.ReturnType()
+	case overload.Sign:
+		return e.E.ReturnType()
+	case overload.Floor:
+		return e.E.ReturnType()
+	case overload.Lower:
+		return e.E.ReturnType()
+	case overload.Round:
+		return e.E.ReturnType()
+	case overload.Upper:
+		return e.E.ReturnType()
+	case overload.Length:
+		return types.T_int
+	case overload.Typeof:
+		return types.T_string
+	case overload.UnaryMinus:
+		return e.E.ReturnType()
 	}
-	return overload.UnaryEval(e.Op, v)
+	return 0
+}
+
+func (e *UnaryExtend) Eval(mp map[string]value.Values) (value.Values, uint32, error) {
+	vs, typ, err := e.E.Eval(mp)
+	if err != nil {
+		return nil, 0, err
+	}
+	return overload.UnaryEval(e.Op, typ, vs)
 }
 
 func (e *UnaryExtend) String() string {
@@ -69,32 +97,65 @@ func (e *BinaryExtend) Attributes() []string {
 	return util.MergeAttributes(e.Left.Attributes(), e.Right.Attributes())
 }
 
-func (e *BinaryExtend) Eval(mp map[string]value.Value) (value.Value, error) {
-	l, err := e.Left.Eval(mp)
+func (e *BinaryExtend) ReturnType() uint32 {
+	switch e.Op {
+	case overload.EQ:
+		return types.T_bool
+	case overload.LT:
+		return types.T_bool
+	case overload.GT:
+		return types.T_bool
+	case overload.LE:
+		return types.T_bool
+	case overload.GE:
+		return types.T_bool
+	case overload.NE:
+		return types.T_bool
+	case overload.Or:
+		return types.T_bool
+	case overload.And:
+		return types.T_bool
+	case overload.Div:
+		lt, rt := e.Left.ReturnType(), e.Right.ReturnType()
+		return returnType(lt, rt)
+	case overload.Mod:
+		lt, rt := e.Left.ReturnType(), e.Right.ReturnType()
+		return returnType(lt, rt)
+	case overload.Plus:
+		lt, rt := e.Left.ReturnType(), e.Right.ReturnType()
+		return returnType(lt, rt)
+	case overload.Mult:
+		lt, rt := e.Left.ReturnType(), e.Right.ReturnType()
+		return returnType(lt, rt)
+	case overload.Minus:
+		lt, rt := e.Left.ReturnType(), e.Right.ReturnType()
+		return returnType(lt, rt)
+	case overload.Typecast:
+		return e.Right.ReturnType()
+	case overload.Like:
+		return types.T_bool
+	case overload.NotLike:
+		return types.T_bool
+	case overload.Match:
+		return types.T_bool
+	case overload.NotMatch:
+		return types.T_bool
+	case overload.Concat:
+		return types.T_string
+	}
+	return 0
+}
+
+func (e *BinaryExtend) Eval(mp map[string]value.Values) (value.Values, uint32, error) {
+	l, lt, err := e.Left.Eval(mp)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	r, err := e.Right.Eval(mp)
+	r, rt, err := e.Right.Eval(mp)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if e.Op == overload.Typecast {
-		switch typ := value.MustBeString(r); typ {
-		case "int":
-			return overload.BinaryEval(e.Op, l, value.NewInt(0))
-		case "bool":
-			return overload.BinaryEval(e.Op, l, value.NewBool(true))
-		case "time":
-			return overload.BinaryEval(e.Op, l, value.NewTime(time.Now()))
-		case "float":
-			return overload.BinaryEval(e.Op, l, value.NewFloat(0.0))
-		case "string":
-			return overload.BinaryEval(e.Op, l, value.NewString(""))
-		default:
-			return nil, fmt.Errorf("typecast '%s' to unsupport '%s'", l, typ)
-		}
-	}
-	return overload.BinaryEval(e.Op, l, r)
+	return overload.BinaryEval(e.Op, lt, rt, l, r)
 }
 
 func (e *BinaryExtend) String() string {
@@ -131,6 +192,12 @@ func (e *BinaryExtend) String() string {
 		return fmt.Sprintf("like(%s, %s)", e.Left.String(), e.Right.String())
 	case overload.NotLike:
 		return fmt.Sprintf("notLike(%s, %s)", e.Left.String(), e.Right.String())
+	case overload.Match:
+		return fmt.Sprintf("match(%s, %s)", e.Left.String(), e.Right.String())
+	case overload.NotMatch:
+		return fmt.Sprintf("notMatch(%s, %s)", e.Left.String(), e.Right.String())
+	case overload.Concat:
+		return fmt.Sprintf("%s ++ %s", e.Left.String(), e.Right.String())
 	}
 	return ""
 }
@@ -164,32 +231,26 @@ func (e *MultiExtend) Attributes() []string {
 	return rs
 }
 
-func (e *MultiExtend) Eval(mp map[string]value.Value) (value.Value, error) {
-	var args []value.Value
+func (e *MultiExtend) ReturnType() uint32 {
+	return 0
+}
+
+func (e *MultiExtend) Eval(mp map[string]value.Values) (value.Values, uint32, error) {
+	var err error
+	var typ uint32
+	var arg value.Values
+	var args []value.Values
 
 	for _, v := range e.Args {
-		arg, err := v.Eval(mp)
-		if err != nil {
-			return nil, err
+		if arg, typ, err = v.Eval(mp); err != nil {
+			return nil, 0, err
 		}
 		args = append(args, arg)
 	}
-	return overload.MultiEval(e.Op, args)
+	return overload.MultiEval(e.Op, typ, args)
 }
 
 func (e *MultiExtend) String() string {
-	switch e.Op {
-	case overload.Concat:
-		var r string
-		for i, arg := range e.Args {
-			if i == 0 {
-				r += fmt.Sprintf("%s", arg)
-			} else {
-				r += fmt.Sprintf(" ++ %s", arg)
-			}
-		}
-		return r
-	}
 	return ""
 }
 
@@ -205,7 +266,7 @@ func (e *ParenExtend) Attributes() []string {
 	return e.E.Attributes()
 }
 
-func (e *ParenExtend) Eval(mp map[string]value.Value) (value.Value, error) {
+func (e *ParenExtend) Eval(mp map[string]value.Values) (value.Values, uint32, error) {
 	return e.E.Eval(mp)
 }
 
@@ -225,13 +286,27 @@ func (a *Attribute) Attributes() []string {
 	return []string{a.Name}
 }
 
-func (a *Attribute) Eval(mp map[string]value.Value) (value.Value, error) {
-	if v, ok := mp[a.Name]; ok {
-		return v, nil
+func (a *Attribute) ReturnType() uint32 {
+	return a.Type
+}
+
+func (a *Attribute) Eval(mp map[string]value.Values) (value.Values, uint32, error) {
+	if vs, ok := mp[a.Name]; ok {
+		return vs, a.Type, nil
 	}
-	return nil, fmt.Errorf("attribute '%s' not exist", a.Name)
+	return nil, 0, fmt.Errorf("attribute '%s' not exist", a.Name)
 }
 
 func (a *Attribute) String() string {
 	return a.Name
+}
+
+func returnType(x, y uint32) uint32 {
+	if x == y {
+		return x
+	}
+	if x == types.T_int || x == types.T_float {
+		return y
+	}
+	return x
 }

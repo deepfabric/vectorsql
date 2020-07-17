@@ -20,24 +20,25 @@ func (c *client) Close() error {
 	return c.db.Close()
 }
 
-func (c *client) Insert(query string, typ string, args [][]interface{}) error {
-	switch typ {
-	case "item":
-		tx, err := c.db.Begin()
-		if err != nil {
+func (c *client) Exec(query string, args [][]interface{}) error {
+	if len(args) == 0 {
+		if _, err := c.db.Exec(query); err != nil {
 			return err
 		}
-		stmt, _ := tx.Prepare(query)
-		defer stmt.Close()
-		for _, arg := range args {
-			if _, err := stmt.Exec(arg...); err != nil {
-				return err
-			}
-		}
-		return tx.Commit()
-	default:
-		return fmt.Errorf("unknown type '%s'", typ)
+		return nil
 	}
+	tx, err := c.db.Begin()
+	if err != nil {
+		return err
+	}
+	stmt, _ := tx.Prepare(query)
+	defer stmt.Close()
+	for _, arg := range args {
+		if _, err := stmt.Exec(arg...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (c *client) Query(query string, typ string) ([]string, error) {

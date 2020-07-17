@@ -1,25 +1,45 @@
 package value
 
 import (
-	"time"
-
 	"github.com/deepfabric/vectorsql/pkg/vm/types"
+	"github.com/pilosa/pilosa/roaring"
 )
+
+type Values interface {
+	Size() int
+
+	Show() ([]byte, error)
+	Read(int, []byte) error
+
+	Count() int
+	Slice() ([]uint64, [][]byte)
+
+	Filter([]uint64) interface{}
+	MergeFilter(interface{}) interface{}
+
+	MarkNull(int) error
+	Append(interface{}) error
+	Update([]int, interface{}) error
+	Merge(*roaring.Bitmap, *roaring.Bitmap) error
+}
 
 type Value interface {
 	Size() int
 
+	ToValues() Values
+
 	String() string
 	Compare(Value) int
-	ResolvedType() *types.T
+	ResolvedType() types.T
 
 	IsLogical() bool
 	IsAndOnly() bool
+	ReturnType() uint32
 	Attributes() []string
-	Eval(map[string]Value) (Value, error)
+	Eval(map[string]Values) (Values, uint32, error)
 }
 
-type Bool bool
+type Bool bool // true = 1, false = 0
 type Int int64
 type Float float64
 type String string
@@ -40,13 +60,9 @@ type Float64 float64
 type Null struct{}
 type Array []Value
 
-type Table struct {
-	Id string
-}
-
-type Time struct {
-	time.Time
-}
+type Data uint32
+type Time uint32 // 0 ~ 24 * 3600
+type Timestamp int64
 
 var (
 	ConstTrue  Bool = true
@@ -56,10 +72,9 @@ var (
 
 // time.Time formats.
 const (
-	// TimeOutputFormat is used to output all time.
-	TimeOutputFormat = "2006-01-02 15:04:05"
-)
+	TimeOutputFormat = "00:00:00"
 
-func (a Array) Len() int           { return len(a) }
-func (a Array) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a Array) Less(i, j int) bool { return a[i].Compare(a[j]) < 0 }
+	DataOutputFormat = "2000-00-00"
+
+	TimestampOutputFormat = "2000-00-00 00:00:00"
+)
