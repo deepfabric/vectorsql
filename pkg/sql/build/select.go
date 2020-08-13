@@ -6,13 +6,14 @@ import (
 	"github.com/deepfabric/vectorsql/pkg/vm/extend/rewrite/not"
 )
 
-func (b *build) buildSelect(n *tree.SelectClause) (extend.Extend, *tree.SelectClause, error) {
-	if err := b.buildFrom(n.From); err != nil {
-		return nil, nil, err
-	}
-	e, err := b.buildWhere(n.Where)
+func (b *build) buildSelect(n *tree.SelectClause) (string, extend.Extend, *tree.SelectClause, error) {
+	id, err := b.buildFrom(n.From)
 	if err != nil {
-		return nil, nil, err
+		return "", nil, nil, err
 	}
-	return not.New().Rewrite(e), n, nil
+	e, err := b.buildWhere(n.Where, id)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	return id, not.New().Rewrite(e), n, nil
 }

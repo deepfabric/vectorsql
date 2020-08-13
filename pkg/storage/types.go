@@ -4,18 +4,12 @@ import (
 	"sync"
 
 	"github.com/deepfabric/thinkkv/pkg/engine"
-	"github.com/deepfabric/vectorsql/pkg/bsi"
 	"github.com/deepfabric/vectorsql/pkg/lru"
 	"github.com/deepfabric/vectorsql/pkg/storage/cache"
 	"github.com/deepfabric/vectorsql/pkg/storage/index"
 	"github.com/deepfabric/vectorsql/pkg/storage/metadata"
 	"github.com/deepfabric/vectorsql/pkg/vm/value"
 	"github.com/pilosa/pilosa/roaring"
-)
-
-const (
-	Item  = "_item"
-	Event = "_event"
 )
 
 type Storage interface {
@@ -29,7 +23,7 @@ type Relation interface {
 
 	IsEvent() bool
 
-	IdMap() (bsi.Bsi, error)
+	Metadata() metadata.Metadata
 
 	AddTuples([]interface{}) error
 
@@ -50,6 +44,8 @@ type storage struct {
 
 type relation struct {
 	sync.RWMutex
+	id  string
+	db  engine.DB
 	idx index.Index
 	md  metadata.Metadata
 }

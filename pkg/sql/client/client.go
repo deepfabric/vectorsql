@@ -2,8 +2,13 @@ package client
 
 import (
 	"database/sql"
-	"fmt"
+	"encoding/binary"
+	"errors"
 	"log"
+	"reflect"
+	"unsafe"
+
+	"github.com/RoaringBitmap/roaring"
 
 	_ "github.com/ClickHouse/clickhouse-go"
 )
@@ -13,11 +18,48 @@ func New(dsn string) (*client, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxIdleConns(20)
 	return &client{db}, nil
 }
 
 func (c *client) Close() error {
 	return c.db.Close()
+}
+
+func (c *client) Query(query string) ([][]string, error) {
+	var rs [][]string
+
+	rows, err := c.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	attrs, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	values := make([]sql.RawBytes, len(attrs))
+	scanArgs := make([]interface{}, len(values))
+	for i := range values {
+		scanArgs[i] = &values[i]
+	}
+	for rows.Next() {
+		if err = rows.Scan(scanArgs...); err != nil {
+			log.Fatal(err)
+		}
+		var v string
+		r := make([]string, len(attrs))
+		for i, col := range values {
+			if col == nil {
+				v = "NULL"
+			} else {
+				v = string(col)
+			}
+			r[i] = v
+		}
+		rs = append(rs, r)
+	}
+	return rs, nil
 }
 
 func (c *client) Exec(query string, args [][]interface{}) error {
@@ -41,60 +83,51 @@ func (c *client) Exec(query string, args [][]interface{}) error {
 	return tx.Commit()
 }
 
-func (c *client) Query(query string, typ string) ([]string, error) {
-	switch typ {
-	case "item":
-		rows, err := c.db.Query(query)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		attrs, err := rows.Columns()
-		if err != nil {
-			return nil, err
-		}
-		var rs []string
-		values := make([]sql.RawBytes, len(attrs))
-		scanArgs := make([]interface{}, len(values))
-		for i := range values {
-			scanArgs[i] = &values[i]
-		}
-		for rows.Next() {
-			if err = rows.Scan(scanArgs...); err != nil {
-				log.Fatal(err)
-			}
-			var r, v string
-			for i, col := range values {
-				if col == nil {
-					v = "NULL"
-				} else {
-					v = string(col)
-				}
-				if i == 0 {
-					r += fmt.Sprintf("%v", v)
-				} else {
-					r += fmt.Sprintf(", %v", v)
-				}
-			}
-			rs = append(rs, r)
-		}
-		return rs, nil
-	case "bitmap":
-		var r string
+func (c *client) Bitmap(query string) (*roaring.Bitmap, error) {
+	var r string
 
-		rows, err := c.db.Query(query)
-		if err != nil {
+	rows, err := c.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err := rows.Scan(&r); err != nil {
 			return nil, err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			if err := rows.Scan(&r); err != nil {
-				return nil, err
-			}
-			break
-		}
-		return []string{r}, nil
-	default:
-		return nil, fmt.Errorf("unknown type '%s'", typ)
+		break
 	}
+	return unmarshalBitMap([]byte(r))
+}
+
+func unmarshalBitMap(data []byte) (*roaring.Bitmap, error) {
+	switch data[0] {
+	case 0:
+		data = data[1:]
+		_, n := binary.Uvarint(data)
+		if n < 0 {
+			return nil, errors.New("overflow")
+		}
+		return roaring.BitmapOf(decodeVector(data[n:])...), nil
+	case 1:
+		data = data[1:]
+		_, n := binary.Uvarint(data)
+		if n < 0 {
+			return nil, errors.New("overflow")
+		}
+		data = data[n:]
+		mp := roaring.New()
+		if err := mp.UnmarshalBinary(data); err != nil {
+			return nil, err
+		}
+		return mp, nil
+	}
+	return nil, nil
+}
+
+func decodeVector(v []byte) []uint32 {
+	hp := *(*reflect.SliceHeader)(unsafe.Pointer(&v))
+	hp.Len /= 4
+	hp.Cap /= 4
+	return *(*[]uint32)(unsafe.Pointer(&hp))
 }

@@ -18,10 +18,10 @@ func New(c context.Context, stg storage.Storage) *optimizer {
 	return &optimizer{c: c, rs: rs, stg: stg}
 }
 
-func (o *optimizer) Optimize(e extend.Extend) (filter.Filter, filter.Filter, error) {
+func (o *optimizer) Optimize(e extend.Extend, id string) (filter.Filter, filter.Filter, error) {
 	for _, r := range o.rs {
 		if r.Match(e) {
-			return r.Rewrite(e)
+			return r.Rewrite(e, id)
 		}
 	}
 	return nil, nil, nil

@@ -266,6 +266,10 @@ func (e *ParenExtend) Attributes() []string {
 	return e.E.Attributes()
 }
 
+func (e *ParenExtend) ReturnType() uint32 {
+	return e.E.ReturnType()
+}
+
 func (e *ParenExtend) Eval(mp map[string]value.Values) (value.Values, uint32, error) {
 	return e.E.Eval(mp)
 }

@@ -5,10 +5,6 @@ import (
 	"github.com/deepfabric/vectorsql/pkg/vm/context"
 )
 
-const (
-	DefaultTable = "people"
-)
-
 type build struct {
 	sql string
 	c   context.Context

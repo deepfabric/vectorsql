@@ -1,20 +1,24 @@
 package context
 
 import (
-	"sync"
+	"errors"
 
 	"github.com/deepfabric/vectorsql/pkg/sql/client"
+	"github.com/deepfabric/vectorsql/pkg/storage"
+)
+
+var (
+	NotExist = errors.New("not exist")
 )
 
 type Context interface {
 	Client() client.Client
-	AttributeType(string) (int32, error)
-	AttributeBelong(string) (string, error)
+	IsIndex(string, string) (bool, error)
+	AttributeType(string, string) (uint32, error)
+	AttributeBelong(string, string) (string, error)
 }
 
 type context struct {
-	sync.RWMutex
 	cli client.Client
-	mp  map[string]int32
-	mq  map[string]string
+	stg storage.Storage
 }

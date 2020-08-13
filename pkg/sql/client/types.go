@@ -1,11 +1,16 @@
 package client
 
-import "database/sql"
+import (
+	"database/sql"
+
+	"github.com/RoaringBitmap/roaring"
+)
 
 type Client interface {
 	Close() error
+	Query(string) ([][]string, error)
 	Exec(string, [][]interface{}) error
-	Query(string, string) ([]string, error)
+	Bitmap(string) (*roaring.Bitmap, error)
 }
 
 type client struct {

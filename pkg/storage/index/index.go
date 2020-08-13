@@ -25,10 +25,6 @@ func New(isE bool, id string, db engine.DB, lc cache.Cache, attrs []metadata.Att
 	}
 }
 
-func (r *index) IdMap() (bsi.Bsi, error) {
-	return getUbsi(ubsiKey(r.id, ID), r.db, r.lc)
-}
-
 func (r *index) Eq(attr string, v value.Value) (*roaring.Bitmap, error) {
 	switch v.ResolvedType() {
 	case types.T_uint8:
@@ -97,6 +93,8 @@ func (r *index) Eq(attr string, v value.Value) (*roaring.Bitmap, error) {
 			return nil, err
 		}
 		return mp.Eq(value.MustBeTimestamp(v).Unix())
+	case types.T_string:
+		return getBitmap(bsKey(r.id, attr, value.MustBeString(v)), r.db, r.lc)
 	}
 	return nil, fmt.Errorf("unsupport type '%s' for Eq", v.ResolvedType())
 }
@@ -466,8 +464,9 @@ func (r *index) AddTuples(ts []interface{}) error {
 
 	seqs = ts[0].([]uint64)
 	smp := make(map[string]bsi.Bsi)
-	for i, j := 1, len(ts); i < j; i++ {
-		if err := r.addTuple(seqs, r.attrs[i], ts[i], smp); err != nil {
+	bmp := make(map[string]*roaring.Bitmap)
+	for i, j := 0, len(ts); i < j; i++ {
+		if err := r.addTuple(seqs, r.attrs[i], ts[i], smp, bmp); err != nil {
 			return err
 		}
 	}
@@ -480,11 +479,42 @@ func (r *index) AddTuples(ts []interface{}) error {
 			return err
 		}
 	}
+	for k, mp := range bmp {
+		v, err := show(mp)
+		if err != nil {
+			return err
+		}
+		if err := r.db.Set([]byte(k), v); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (r *index) addTuple(seqs []uint64, attr metadata.Attribute, t interface{}, smp map[string]bsi.Bsi) error {
+func (r *index) addTuple(seqs []uint64, attr metadata.Attribute, t interface{}, smp map[string]bsi.Bsi, bmp map[string]*roaring.Bitmap) error {
 	switch attr.Type {
+	case types.T_string:
+		if !attr.Index {
+			break
+		}
+		{
+			vs := t.([]string)
+			for i, v := range vs {
+				k := bsKey(r.id, attr.Name, v)
+				mp, ok := bmp[k]
+				if !ok {
+					var err error
+					if mp, err = getBitmap(k, r.db, r.lc); err != nil {
+						return err
+					}
+					if mp == nil {
+						mp = roaring.NewBitmap()
+					}
+					bmp[k] = mp
+				}
+				mp.Add(seqs[i])
+			}
+		}
 	case types.T_timestamp:
 		{
 			var mp bsi.Bsi
@@ -830,6 +860,16 @@ func ubsiKey(id, attr string) string {
 	buf.WriteByte('.')
 	buf.WriteString(attr)
 	buf.WriteString(".U")
+	return buf.String()
+}
+
+func bsKey(id, attr string, v string) string {
+	var buf bytes.Buffer
+
+	buf.WriteString(id)
+	buf.WriteByte('.')
+	buf.WriteString(attr)
+	buf.WriteString(fmt.Sprintf(".V.%v", v))
 	return buf.String()
 }
 

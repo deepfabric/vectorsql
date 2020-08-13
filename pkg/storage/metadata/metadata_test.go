@@ -14,8 +14,8 @@ func TestMetadata(t *testing.T) {
 	var as []Attribute
 
 	{
-		as = append(as, Attribute{types.T_uint8, "age"})
-		as = append(as, Attribute{types.T_string, "name"})
+		as = append(as, Attribute{true, types.T_uint8, "age"})
+		as = append(as, Attribute{false, types.T_string, "name"})
 	}
 	md := Metadata{true, as}
 	data, err := encoding.Encode(md)

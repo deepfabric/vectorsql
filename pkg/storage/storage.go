@@ -1,15 +1,11 @@
 package storage
 
 import (
-	"fmt"
-
 	"github.com/deepfabric/thinkkv/pkg/engine"
-	"github.com/deepfabric/vectorsql/pkg/bsi"
 	"github.com/deepfabric/vectorsql/pkg/lru"
 	"github.com/deepfabric/vectorsql/pkg/storage/cache"
 	"github.com/deepfabric/vectorsql/pkg/storage/index"
 	"github.com/deepfabric/vectorsql/pkg/storage/metadata"
-	"github.com/deepfabric/vectorsql/pkg/vm/types"
 	"github.com/deepfabric/vectorsql/pkg/vm/util/encoding"
 	"github.com/deepfabric/vectorsql/pkg/vm/value"
 	"github.com/pilosa/pilosa/roaring"
@@ -44,6 +40,8 @@ func (s *storage) Relation(id string) (Relation, error) {
 			return nil, err
 		}
 	}
+	r.id = id
+	r.db = s.db
 	r.idx = index.New(r.md.IsE, id, s.db, s.lc, r.md.Attrs)
 	s.rc.Add(id, r)
 	return r, nil
@@ -60,31 +58,18 @@ func (s *storage) NewRelation(id string, md metadata.Metadata) error {
 	if err != nil {
 		return err
 	}
-	if !md.IsE {
-		if md.Attrs[0].Name != index.SEQ && md.Attrs[0].Type != types.T_uint64 {
-			return fmt.Errorf("need attribute seq(uint64)")
-		}
-		if err := bat.Set([]byte(Item), []byte(id)); err != nil {
-			bat.Cancel()
-			return err
-		}
-	} else {
-		if md.Attrs[0].Name != index.SEQ && md.Attrs[0].Type != types.T_uint64 {
-			return fmt.Errorf("need attribute seq(uint64)")
-		}
-		if md.Attrs[1].Name != index.ID && md.Attrs[1].Type != types.T_uint64 {
-			return fmt.Errorf("need attribute id(uint64)")
-		}
-		if err := bat.Set([]byte(Event), []byte(id)); err != nil {
-			bat.Cancel()
-			return err
-		}
-	}
 	if err := bat.Set(metadata.Mkey(id), data); err != nil {
 		bat.Cancel()
 		return err
 	}
+	defer s.db.Sync()
 	return bat.Commit()
+}
+
+func (r *relation) String() string {
+	r.Lock()
+	defer r.Unlock()
+	return r.id
 }
 
 func (r *relation) Destroy() error {
@@ -99,15 +84,16 @@ func (r *relation) IsEvent() bool {
 	return r.md.IsE
 }
 
-func (r *relation) IdMap() (bsi.Bsi, error) {
+func (r *relation) Metadata() metadata.Metadata {
 	r.RLock()
 	defer r.RUnlock()
-	return r.idx.IdMap()
+	return r.md
 }
 
 func (r *relation) AddTuples(ts []interface{}) error {
 	r.Lock()
 	defer r.Unlock()
+	defer r.db.Sync()
 	return r.idx.AddTuples(ts)
 }
 

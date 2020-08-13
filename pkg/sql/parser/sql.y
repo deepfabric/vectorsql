@@ -28,11 +28,7 @@ func (u *sqlSymUnion) setNegative() *tree.Value{
     if !ok {
         return nil
     }
-    i, ok := value.AsInt(v.E)
-    if !ok {
-        return nil
-    }
-    return &tree.Value{value.NewInt(int64(i)*-1)}
+    return &tree.Value{value.NewInt(int64(value.MustBeInt(v.E))*-1)}
 }
 
 func (u *sqlSymUnion) valueStatement() *tree.Value {
@@ -578,7 +574,7 @@ d_expr: ICONST          { $$.val = $1.valueStatement() }
       | SCONST          { $$.val = $1.valueStatement() }
       | TRUE            { $$.val = &tree.Value{&value.ConstTrue} }
       | FALSE           { $$.val = &tree.Value{&value.ConstFalse} }
-      | NULL            { $$.val = &tree.Value{&value.ConstNull} }
+      | NULL            { $$.val = &tree.Value{value.ConstNull} }
       | '(' a_expr ')'  { $$.val = &tree.ParenExpr{$2.exprStatement()} }
 
 signed_iconst: ICONST       { $$.val = $1.valueStatement() }

@@ -11,6 +11,8 @@ type ExprStatement interface {
 	exprStatement()
 }
 
+func (*Index) exprStatement() {}
+
 func (*Value) exprStatement() {}
 
 func (*OrExpr) exprStatement()  {}
@@ -97,6 +99,11 @@ func (es ExprStatements) String() string {
 		s += es[i].String()
 	}
 	return s
+}
+
+func (e *Index) String() string { return "indexOf(xids, xid)" }
+
+type Index struct {
 }
 
 type Value struct {

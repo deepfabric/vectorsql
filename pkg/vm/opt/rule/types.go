@@ -7,5 +7,5 @@ import (
 
 type Rule interface {
 	Match(extend.Extend) bool
-	Rewrite(extend.Extend) (filter.Filter, filter.Filter, error)
+	Rewrite(extend.Extend, string) (filter.Filter, filter.Filter, error)
 }

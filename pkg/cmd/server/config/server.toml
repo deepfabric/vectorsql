@@ -1,0 +1,11 @@
+port        = 8888
+routines    = 16
+db          = "test.db"
+dsn         = "tcp://172.19.0.17:9000?username=cdp_user&password=infinivision2019"
+url         = "http://172.19.0.17:6930/face_emb"
+addrs       = ["172.19.0.17:8081", "172.19.0.17:8082", "172.19.0.17:8083"]
+cachesize   = 1048576
+
+[log]
+level   = "debug"
+prefix  = "vectorsql:"

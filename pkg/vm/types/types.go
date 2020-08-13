@@ -3,7 +3,8 @@ package types
 import "fmt"
 
 const (
-	T_int = iota // int64
+	T_null = iota
+	T_int  // int64
 	T_bool
 	T_float // float64
 	T_array
@@ -25,6 +26,8 @@ type T uint32
 
 func (t T) Size() int {
 	switch t {
+	case T_null:
+		return 1
 	case T_int:
 		return 8
 	case T_bool:
@@ -61,6 +64,8 @@ func (t T) Size() int {
 
 func (t T) String() string {
 	switch t {
+	case T_null:
+		return "NULL"
 	case T_int:
 		return "INT"
 	case T_bool:

@@ -9,7 +9,9 @@ import (
 )
 
 const (
-	mprefix = "_M." // metadata
+	mprefix = "_M."    // metadata
+	isuffix = "_item"  // item
+	esuffix = "_event" // event
 )
 
 func init() {
@@ -19,6 +21,22 @@ func init() {
 
 func (a Attribute) String() string {
 	return fmt.Sprintf("%s(%s)", a.Name, types.T(a.Type))
+}
+
+func Ikey(id string) string {
+	var buf bytes.Buffer
+
+	buf.WriteString(id)
+	buf.WriteString(isuffix)
+	return buf.String()
+}
+
+func Ekey(id string) string {
+	var buf bytes.Buffer
+
+	buf.WriteString(id)
+	buf.WriteString(esuffix)
+	return buf.String()
 }
 
 func Mkey(id string) []byte {

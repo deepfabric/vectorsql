@@ -1,31 +1,15 @@
 package context
 
 import (
-	"fmt"
-
 	"github.com/deepfabric/vectorsql/pkg/sql/client"
-	"github.com/deepfabric/vectorsql/pkg/vm/types"
+	"github.com/deepfabric/vectorsql/pkg/storage"
+	"github.com/deepfabric/vectorsql/pkg/storage/metadata"
 )
 
-var Types = map[string]int32{
-	"seq":  types.T_uint32,
-	"age":  types.T_uint8,
-	"sex":  types.T_uint8,
-	"area": types.T_string,
-}
-
-var Tables = map[string]string{
-	"seq":  "people",
-	"age":  "people",
-	"sex":  "people",
-	"area": "people",
-}
-
-func New(cli client.Client) *context {
+func New(cli client.Client, stg storage.Storage) *context {
 	return &context{
 		cli: cli,
-		mp:  Types,
-		mq:  Tables,
+		stg: stg,
 	}
 }
 
@@ -33,20 +17,76 @@ func (c *context) Client() client.Client {
 	return c.cli
 }
 
-func (c *context) AttributeBelong(attr string) (string, error) {
-	c.RLock()
-	defer c.RUnlock()
-	if v, ok := c.mq[attr]; ok {
-		return v, nil
+func (c *context) IsIndex(name, id string) (bool, error) {
+	{
+		r, err := c.stg.Relation(metadata.Ikey(id))
+		switch {
+		case err == nil:
+			attrs := r.Metadata().Attrs
+			for _, attr := range attrs {
+				if attr.Name == name {
+					return attr.Index, nil
+				}
+			}
+		case err == NotExist:
+		default:
+			return false, err
+		}
 	}
-	return "", fmt.Errorf("attribute '%s' not exist", attr)
+	r, err := c.stg.Relation(metadata.Ikey(id))
+	if err != nil {
+		return false, err
+	}
+	attrs := r.Metadata().Attrs
+	for _, attr := range attrs {
+		if attr.Name == name {
+			return attr.Index, nil
+		}
+	}
+	return false, NotExist
 }
 
-func (c *context) AttributeType(attr string) (int32, error) {
-	c.RLock()
-	defer c.RUnlock()
-	if v, ok := c.mp[attr]; ok {
-		return v, nil
+func (c *context) AttributeBelong(name, id string) (string, error) {
+	{
+		_, err := c.attributeType(name, metadata.Ikey(id))
+		switch {
+		case err == nil:
+			return metadata.Ikey(id), nil
+		case err == NotExist:
+		default:
+			return "", err
+		}
 	}
-	return -1, fmt.Errorf("attribute '%s' not exist", attr)
+	if _, err := c.attributeType(name, metadata.Ekey(id)); err != nil {
+		return "", err
+	}
+	return metadata.Ekey(id), nil
+}
+
+func (c *context) AttributeType(name, id string) (uint32, error) {
+	{
+		typ, err := c.attributeType(name, metadata.Ikey(id))
+		switch {
+		case err == nil:
+			return typ, nil
+		case err == NotExist:
+		default:
+			return 0, err
+		}
+	}
+	return c.attributeType(name, metadata.Ekey(id))
+}
+
+func (c *context) attributeType(name, id string) (uint32, error) {
+	r, err := c.stg.Relation(id)
+	if err != nil {
+		return 0, err
+	}
+	attrs := r.Metadata().Attrs
+	for _, attr := range attrs {
+		if attr.Name == name {
+			return attr.Type, nil
+		}
+	}
+	return 0, NotExist
 }

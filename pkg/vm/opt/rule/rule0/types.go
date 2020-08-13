@@ -7,7 +7,8 @@ import (
 
 type rule struct {
 	flg bool // whether there is false
-	mp  map[int32]bool
+	mp  map[uint32]bool
+	mq  map[uint32]bool
 	stg storage.Storage
 	c   context.Context
 }

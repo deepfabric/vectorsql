@@ -15,7 +15,7 @@ func New(cs []*Condition, r storage.Relation) *filter {
 func (f *filter) String() string {
 	var buf bytes.Buffer
 
-	buf.WriteString(fmt.Sprintf("SELECT groupBitmapState(seq) FROM %s WHERE ", f.r))
+	buf.WriteString(fmt.Sprintf("SELECT groupBitmapState(uid) FROM %s WHERE ", f.r))
 	for i, c := range f.cs {
 		if i > 0 {
 			buf.WriteString(" AND ")
@@ -105,19 +105,5 @@ func (f *filter) Bitmap() (*roaring.Bitmap, error) {
 			}
 		}
 	}
-	if !f.r.IsEvent() {
-		return m, nil
-	}
-	mp, err := f.r.IdMap()
-	if err != nil {
-		return nil, err
-	}
-	is := m.Slice()
-	var xs []uint64
-	for _, i := range is {
-		if v, ok := mp.Get(i); ok {
-			xs = append(xs, v.(uint64))
-		}
-	}
-	return roaring.NewBitmap(xs...), nil
+	return m, nil
 }

@@ -28,7 +28,7 @@ func (b *build) Build() (*op.OP, error) {
 func (b *build) buildStatement(n *tree.Select) (*op.OP, error) {
 	var o op.OP
 
-	e, sc, err := b.buildRelation(n.Relation)
+	id, e, sc, err := b.buildRelation(n.Relation)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +36,7 @@ func (b *build) buildStatement(n *tree.Select) (*op.OP, error) {
 	sc.Where = nil
 	n.Relation = sc
 	if e != nil {
-		c, i, err := opt.New(b.c, b.stg).Optimize(e)
+		c, i, err := opt.New(b.c, b.stg).Optimize(e, id)
 		if err != nil {
 			return nil, err
 		}

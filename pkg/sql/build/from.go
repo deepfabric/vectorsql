@@ -6,38 +6,29 @@ import (
 	"github.com/deepfabric/vectorsql/pkg/sql/tree"
 )
 
-func (b *build) buildFrom(n *tree.From) error {
+func (b *build) buildFrom(n *tree.From) (string, error) {
 	for i := range n.Tables {
 		switch t := n.Tables[i].(type) {
 		case *tree.AliasedTable:
-			if err := b.buildAliasedTable(t); err != nil {
-				return err
-			}
+			return b.buildAliasedTable(t)
 		default:
-			return fmt.Errorf("illegal table '%s'", n.Tables[i])
+			return "", fmt.Errorf("illegal table '%s'", n.Tables[i])
 		}
 	}
-	return nil
+	return "", nil
 }
 
-func (b *build) buildAliasedTable(n *tree.AliasedTable) error {
+func (b *build) buildAliasedTable(n *tree.AliasedTable) (string, error) {
 	switch t := n.Tbl.(type) {
 	case *tree.Subquery:
-		return fmt.Errorf("'%s' unsupport now", n)
+		return "", fmt.Errorf("'%s' unsupport now", n)
 	case *tree.TableName:
 		return b.buildTableName(t)
 	default:
-		return fmt.Errorf("illegal aliased table '%s'", n)
+		return "", fmt.Errorf("illegal aliased table '%s'", n)
 	}
 }
 
-func (b *build) buildTableName(n *tree.TableName) error {
-	name, err := b.buildExprColumn(n.N)
-	if err != nil {
-		return err
-	}
-	if name != DefaultTable {
-		return fmt.Errorf("table '%s' not exist", name)
-	}
-	return nil
+func (b *build) buildTableName(n *tree.TableName) (string, error) {
+	return b.buildExprColumn(n.N)
 }

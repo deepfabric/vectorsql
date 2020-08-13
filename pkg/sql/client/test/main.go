@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"reflect"
+	"time"
 	"unsafe"
 
 	"github.com/RoaringBitmap/roaring"
@@ -18,36 +20,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	/*
-		var args [][]interface{}
-
-		{
-			arg := []interface{}{uint32(0), uint8(0), uint8(10), "shanghai"}
-			args = append(args, arg)
-		}
-		{
-			arg := []interface{}{uint32(1), uint8(1), uint8(20), "beijing"}
-			args = append(args, arg)
-		}
-		if err := cli.Insert("insert into people (seq, sex, age, area) VALUES (?, ?, ?, ?) (?, ?, ?, ?)", "item", args); err != nil {
-			log.Fatalf("failed to insert: %v\n", err)
-		}
-	*/
-	rows, err := cli.Query(os.Args[1], os.Args[2])
-	if err != nil {
+	t := time.Now()
+	if ts, err := cli.Query(os.Args[1]); err != nil {
 		log.Fatal(err)
-	}
-	if os.Args[2] == "item" {
-		for _, row := range rows {
-			fmt.Printf("%v\n", row)
+	} else {
+		for i, t := range ts {
+			n := len(t) - 1
+			ioutil.WriteFile(fmt.Sprintf("%v.jpg", i), []byte(t[n]), os.FileMode(0664))
 		}
-		return
 	}
-	mp, err := UnmarshalMap([]byte(rows[0]))
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Printf("id list: %v\n", mp.ToArray())
+	fmt.Printf("process: %v\n", time.Now().Sub(t))
 }
 
 func UnmarshalMap(data []byte) (*roaring.Bitmap, error) {

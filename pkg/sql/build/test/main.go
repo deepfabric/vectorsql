@@ -6,24 +6,33 @@ import (
 	"os"
 
 	"github.com/deepfabric/thinkkv/pkg/engine/pb"
+	"github.com/deepfabric/vectorsql/pkg/lru"
 	"github.com/deepfabric/vectorsql/pkg/sql/build"
 	"github.com/deepfabric/vectorsql/pkg/storage"
+	"github.com/deepfabric/vectorsql/pkg/storage/cache"
+	"github.com/deepfabric/vectorsql/pkg/storage/metadata"
 	"github.com/deepfabric/vectorsql/pkg/vm/context"
-	lru "github.com/hashicorp/golang-lru"
+	"github.com/deepfabric/vectorsql/pkg/vm/types"
 )
 
 func main() {
-	bc, err := lru.New(100)
-	if err != nil {
-		log.Fatal(err)
+	db := pb.New("test.db", nil, 0, false, false)
+	defer db.Close()
+	stg := storage.New(db, lru.New(10), cache.New(1<<20))
+	{
+		var attrs []metadata.Attribute
+
+		attrs = append(attrs, metadata.Attribute{types.T_uint64, "uid"})
+		attrs = append(attrs, metadata.Attribute{types.T_uint8, "age"})
+		attrs = append(attrs, metadata.Attribute{types.T_string, "pic"})
+		if err := stg.NewRelation("user_item", metadata.Metadata{
+			IsE:   false,
+			Attrs: attrs,
+		}); err != nil {
+			log.Fatal(err)
+		}
 	}
-	rc, err := lru.New(10000)
-	if err != nil {
-		log.Fatal(err)
-	}
-	db := pb.New("test.db", nil, 1024*1024*1024, false, false)
-	stg := storage.New(10, db, bc, rc)
-	o, err := build.New(os.Args[1], context.New(nil), stg).Build()
+	o, err := build.New(os.Args[1], context.New(nil, stg), stg).Build()
 	if err != nil {
 		log.Fatal(err)
 	}

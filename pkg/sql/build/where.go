@@ -5,9 +5,9 @@ import (
 	"github.com/deepfabric/vectorsql/pkg/vm/extend"
 )
 
-func (b *build) buildWhere(n *tree.Where) (extend.Extend, error) {
+func (b *build) buildWhere(n *tree.Where, id string) (extend.Extend, error) {
 	if n == nil {
 		return nil, nil
 	}
-	return b.buildExpr(n.E)
+	return b.buildExpr(n.E, id)
 }

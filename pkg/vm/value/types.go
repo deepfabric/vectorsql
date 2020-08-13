@@ -26,8 +26,6 @@ type Values interface {
 type Value interface {
 	Size() int
 
-	ToValues() Values
-
 	String() string
 	Compare(Value) int
 	ResolvedType() types.T
@@ -74,7 +72,7 @@ var (
 const (
 	TimeOutputFormat = "00:00:00"
 
-	DataOutputFormat = "2000-00-00"
+	DataOutputFormat = "0000-00-00"
 
-	TimestampOutputFormat = "2000-00-00 00:00:00"
+	TimestampOutputFormat = "2006-01-02 15:04:05"
 )
