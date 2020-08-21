@@ -68,6 +68,6 @@ func main() {
 		Ctx: context.New(cli, stg),
 		Rts: routines.New(cfg.Routines),
 	}
-	srv := server.New(cfg.Port, scfg)
+	srv := server.New(cfg.Port, cfg.Dsn, scfg)
 	srv.Run()
 }

@@ -2,6 +2,7 @@ package bv
 
 import (
 	"encoding/binary"
+	"time"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/deepfabric/beevector/pkg/sdk"
@@ -9,7 +10,7 @@ import (
 )
 
 func New(addrs []string, log logger.Log) *bv {
-	return &bv{sdk.NewClient(addrs...), log}
+	return &bv{sdk.NewClient(addrs, sdk.WithTimeout(5*time.Minute)), log}
 }
 
 func (b *bv) Add(xbs []float32, xids []int64) error {
@@ -17,7 +18,7 @@ func (b *bv) Add(xbs []float32, xids []int64) error {
 }
 
 func (b *bv) Fvectors(n int64, v []float32) (*roaring.Bitmap, []uint64, error) {
-	_, vs, err := b.cli.Search(n, v, nil)
+	_, vs, err := b.cli.Search(n, v, nil, false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -34,14 +35,14 @@ func (b *bv) Vectors(n int64, mp *roaring.Bitmap, v []float32) (*roaring.Bitmap,
 		buf := make([]byte, 11)
 		buf[0] = 1
 		num := binary.PutUvarint(buf[1:], uint64(len(data)))
-		_, vs, err := b.cli.Search(n, v, append(buf[:1+num], data...))
+		_, vs, err := b.cli.Search(n, v, append(buf[:1+num], data...), false)
 		if err != nil {
 			return nil, nil, err
 		}
 		mp, ids := genIds(vs)
 		return mp, ids, nil
 	}
-	_, vs, err := b.cli.Search(n, v, nil)
+	_, vs, err := b.cli.Search(n, v, nil, false)
 	if err != nil {
 		return nil, nil, err
 	}

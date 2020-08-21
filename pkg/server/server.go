@@ -15,14 +15,16 @@ import (
 	"github.com/deepfabric/vectorsql/pkg/request"
 	"github.com/deepfabric/vectorsql/pkg/routines/task"
 	"github.com/deepfabric/vectorsql/pkg/sql/build"
+	"github.com/deepfabric/vectorsql/pkg/sql/client"
 	"github.com/deepfabric/vectorsql/pkg/storage/metadata"
 	"github.com/deepfabric/vectorsql/pkg/vm/types"
 	"github.com/deepfabric/vectorsql/pkg/vm/value"
 	"github.com/valyala/fasthttp"
 )
 
-func New(port int, cfg *Config) Server {
+func New(port int, dsn string, cfg *Config) Server {
 	return &server{
+		dsn:  dsn,
 		port: port,
 		b:    cfg.B,
 		cli:  cfg.Cli,
@@ -46,6 +48,8 @@ func (s *server) Run() {
 				s.dealCreate(ctx)
 			case "/insert":
 				s.dealInsert(ctx)
+			case "/insertWithVector":
+				s.dealInsertWithVector(ctx)
 			default:
 				ctx.Error("Unsupport Path", fasthttp.StatusNotFound)
 			}
@@ -242,11 +246,19 @@ func (s *server) dealInsert(ctx *fasthttp.RequestCtx) {
 				}
 				query += ")"
 			}
-			if err := s.cli.Exec(query, cargs); err != nil {
+			cli, err := client.New(s.dsn)
+			if err != nil {
 				ctx.Response.SetStatusCode(500)
 				ctx.Write([]byte(err.Error()))
 				return
 			}
+			if err := cli.Exec(query, cargs); err != nil {
+				cli.Close()
+				ctx.Response.SetStatusCode(500)
+				ctx.Write([]byte(err.Error()))
+				return
+			}
+			cli.Close()
 		}
 		{
 			if err := r.AddTuples(iargs); err != nil {
@@ -268,6 +280,104 @@ func (s *server) dealInsert(ctx *fasthttp.RequestCtx) {
 		ts = ts[n:]
 	}
 	ctx.Write([]byte(fmt.Sprintf("success: skip uid list: %v", rids)))
+}
+
+func (s *server) dealInsertWithVector(ctx *fasthttp.RequestCtx) {
+	ctx.Response.SetStatusCode(200)
+	ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+	ctx.Response.Header.Set("Content-Type", "application/json")
+	name := ctx.QueryArgs().Peek("name")
+	if len(name) == 0 {
+		ctx.Response.SetStatusCode(400)
+		ctx.Write([]byte("need table's name"))
+		return
+	}
+	ts, err := csv.NewReader(bytes.NewReader(ctx.PostBody())).ReadAll()
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Write([]byte(err.Error()))
+		return
+	}
+	id := metadata.Ikey(string(name))
+	r, err := s.stg.Relation(id)
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Write([]byte(err.Error()))
+		return
+	}
+	attrs := r.Metadata().Attrs
+	for len(ts) > 0 {
+		{
+			s.log.Debugf("tuples %v\n", len(ts))
+		}
+		n := len(ts)
+		if n > 5000 {
+			n = 5000
+		}
+		xbs, xids, iargs, cargs, err := s.convertWithVector(ts[:n], attrs)
+		if err != nil {
+			ctx.Response.SetStatusCode(400)
+			ctx.Write([]byte(err.Error()))
+			return
+		}
+		{
+			query := fmt.Sprintf("insert into %s (", id)
+			for i, attr := range attrs {
+				if i == 0 {
+					query += fmt.Sprintf("%s", attr.Name)
+				} else {
+					query += fmt.Sprintf(", %s", attr.Name)
+				}
+			}
+			query += ") VALUES"
+			{
+				s.log.Debugf("convert ok %v: %v -> %v\n", query, n, len(cargs))
+			}
+			for _, _ = range cargs {
+				query += " ("
+				for i := range attrs {
+					if i == 0 {
+						query += "?"
+					} else {
+						query += ", ?"
+					}
+				}
+				query += ")"
+			}
+			cli, err := client.New(s.dsn)
+			if err != nil {
+				ctx.Response.SetStatusCode(500)
+				ctx.Write([]byte(err.Error()))
+				return
+			}
+			if err := cli.Exec(query, cargs); err != nil {
+				cli.Close()
+				ctx.Response.SetStatusCode(500)
+				ctx.Write([]byte(err.Error()))
+				return
+			}
+			cli.Close()
+		}
+		{
+			if err := r.AddTuples(iargs); err != nil {
+				ctx.Response.SetStatusCode(500)
+				ctx.Write([]byte(err.Error()))
+				return
+			}
+		}
+		{
+			{
+				s.log.Debugf("xbs: %v, xids: %v\n", len(xbs), len(xids))
+			}
+			if err := s.b.Add(xbs, xids); err != nil {
+				ctx.Response.SetStatusCode(500)
+				ctx.Write([]byte(err.Error()))
+				return
+			}
+		}
+		ts = ts[n:]
+	}
+	ctx.Write([]byte(fmt.Sprintf("success")))
 }
 
 func (s *server) convert(ts [][]string, attrs []metadata.Attribute) ([]string, []float32, []int64, []interface{}, [][]interface{}, error) {
@@ -327,6 +437,44 @@ func (s *server) convert(ts [][]string, attrs []metadata.Attribute) ([]string, [
 		cargs = append(cargs, arg)
 	}
 	return rids, xbs, xids, iargs, cargs, nil
+}
+
+func (s *server) convertWithVector(ts [][]string, attrs []metadata.Attribute) ([]float32, []int64, []interface{}, [][]interface{}, error) {
+	xbs := make([]float32, 0, len(ts)*512)
+	xids := make([]int64, 0, len(ts))
+	iargs := make([]interface{}, len(attrs))
+	cargs := make([][]interface{}, 0, len(ts))
+	{
+		for i := range attrs {
+			iargs[i] = newSlice(attrs[i].Type, len(ts))
+		}
+	}
+	for i, t := range ts {
+		var vec []float32
+
+		n := len(t) - 1
+		if err := json.Unmarshal([]byte(t[n]), &vec); err != nil {
+			return nil, nil, nil, nil, err
+		}
+		ts[i] = t[:n-1]
+		xbs = append(xbs, vec...)
+	}
+	for _, t := range ts {
+		arg := make([]interface{}, len(attrs))
+		for i, attr := range attrs {
+			v, rs, err := appendSlice(iargs[i], attr.Type, t[i])
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+			arg[i] = v
+			iargs[i] = rs
+			if i == 1 {
+				xids = append(xids, int64(v.(uint64)))
+			}
+		}
+		cargs = append(cargs, arg)
+	}
+	return xbs, xids, iargs, cargs, nil
 }
 
 func (s *server) extractParameters(ctx *fasthttp.RequestCtx) (string, []float32, error) {

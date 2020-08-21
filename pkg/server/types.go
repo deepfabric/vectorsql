@@ -54,6 +54,7 @@ type faceResult struct {
 type server struct {
 	port int
 	b    bv.BV
+	dsn  string
 	log  logger.Log
 	cli  client.Client
 	vec  vector.Vector
