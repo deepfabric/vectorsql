@@ -53,20 +53,18 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	for i := 0; i < 30; i++ {
-		for _, t := range ts {
-			if len(t) != 513 {
-				continue
-			}
-			vec, err := getVector(t[1:])
-			if err != nil {
-				continue
-			}
-			fmt.Printf("%v,%v,%v,%v,%v,%v,%v,%s\n",
-				uid, (pid | uid<<34), t[0], String(17), sexs[uid%2], cities[int(uid)%len(cities)], time.Now().Add(time.Duration(pid|uid<<34)).Format(TimestampOutputFormat), vec)
-			uid++
-			pid++
+	for _, t := range ts {
+		if len(t) != 513 {
+			continue
 		}
+		vec, err := getVector(t[1:])
+		if err != nil {
+			continue
+		}
+		fmt.Printf("%v,%v,%v,%v,%v,%v,%v,\"%s\"\n",
+			uid, (pid | uid<<34), t[0], String(17), sexs[uid%2], cities[int(uid)%len(cities)], time.Now().Add(time.Duration(pid|uid<<34)).Format(TimestampOutputFormat), vec)
+		uid++
+		pid++
 	}
 }
 

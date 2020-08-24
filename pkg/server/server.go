@@ -44,6 +44,8 @@ func (s *server) Run() {
 			switch string(ctx.Path()) {
 			case "/query":
 				s.dealQuery(ctx)
+			case "/queryWithVector":
+				s.dealQueryWithVector(ctx)
 			case "/create":
 				s.dealCreate(ctx)
 			case "/insert":
@@ -72,6 +74,50 @@ func (s *server) dealQuery(ctx *fasthttp.RequestCtx) {
 	ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
 	ctx.Response.Header.Set("Content-Type", "application/json")
 	qr, vec, err := s.extractParameters(ctx)
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Write([]byte(err.Error()))
+		return
+	}
+	o, err := build.New(qr, s.ctx, s.stg).Build()
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Write([]byte(err.Error()))
+		return
+	}
+	{
+		s.log.Debugf("T: %v\n", o.T)
+	}
+	{
+		s.log.Debugf("N: %v\n", o.N)
+	}
+	{
+		s.log.Debugf("CF: %v\n", o.Cf)
+	}
+	{
+		s.log.Debugf("IF: %v\n", o.If)
+	}
+	rows, err := o.Result(s.log, s.b, s.cli, vec)
+	if err != nil {
+		ctx.Response.SetStatusCode(400)
+		ctx.Write([]byte(err.Error()))
+		return
+	}
+	if err := csv.NewWriter(bufio.NewWriter(&buf)).WriteAll(rows); err != nil {
+		ctx.Response.SetStatusCode(500)
+		ctx.Write([]byte(err.Error()))
+		return
+	}
+	ctx.Write(buf.Bytes())
+}
+
+func (s *server) dealQueryWithVector(ctx *fasthttp.RequestCtx) {
+	var buf bytes.Buffer
+
+	ctx.Response.SetStatusCode(200)
+	ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+	ctx.Response.Header.Set("Content-Type", "application/json")
+	qr, vec, err := s.extractParametersWithVector(ctx)
 	if err != nil {
 		ctx.Response.SetStatusCode(400)
 		ctx.Write([]byte(err.Error()))
@@ -449,14 +495,12 @@ func (s *server) convertWithVector(ts [][]string, attrs []metadata.Attribute) ([
 			iargs[i] = newSlice(attrs[i].Type, len(ts))
 		}
 	}
-	for i, t := range ts {
+	for _, t := range ts {
 		var vec []float32
 
-		n := len(t) - 1
-		if err := json.Unmarshal([]byte(t[n]), &vec); err != nil {
+		if err := json.Unmarshal([]byte(t[len(t)-1]), &vec); err != nil {
 			return nil, nil, nil, nil, err
 		}
-		ts[i] = t[:n-1]
 		xbs = append(xbs, vec...)
 	}
 	for _, t := range ts {
@@ -521,6 +565,51 @@ func (s *server) extractParameters(ctx *fasthttp.RequestCtx) (string, []float32,
 	}
 	vec, err := s.vec.GetVector(fs)
 	if err != nil {
+		return "", nil, err
+	}
+	return qr, vec, nil
+}
+
+func (s *server) extractParametersWithVector(ctx *fasthttp.RequestCtx) (string, []float32, error) {
+	var typ string
+	var body []byte
+	var vec []float32
+	var mp map[string]interface{}
+
+	form, err := ctx.MultipartForm()
+	if err != nil {
+		return "", nil, err
+	}
+	for _, v := range form.File {
+		for i, h := range v {
+			if i == 0 {
+				typ = h.Header.Get("Content-Type")
+			}
+			fp, err := h.Open()
+			if err != nil {
+				return "", nil, err
+			}
+			data, err := ioutil.ReadAll(fp)
+			if err != nil {
+				fp.Close()
+				return "", nil, err
+			}
+			fp.Close()
+			body = append(body, data...)
+		}
+		if len(body) > 0 {
+			if typ == "application/json" {
+				if err := json.Unmarshal(body, &mp); err != nil {
+					return "", nil, err
+				}
+			}
+		}
+	}
+	qr, err := s.getSqlQuery(mp)
+	if err != nil {
+		return "", nil, err
+	}
+	if err := json.Unmarshal(body, &vec); err != nil {
 		return "", nil, err
 	}
 	return qr, vec, nil
