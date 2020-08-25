@@ -572,6 +572,7 @@ func (s *server) extractParameters(ctx *fasthttp.RequestCtx) (string, []float32,
 
 func (s *server) extractParametersWithVector(ctx *fasthttp.RequestCtx) (string, []float32, error) {
 	var typ string
+	var data []byte
 	var body []byte
 	var vec []float32
 	var mp map[string]interface{}
@@ -602,14 +603,17 @@ func (s *server) extractParametersWithVector(ctx *fasthttp.RequestCtx) (string, 
 				if err := json.Unmarshal(body, &mp); err != nil {
 					return "", nil, err
 				}
+			} else {
+				data = body
 			}
+			body = []byte{}
 		}
 	}
 	qr, err := s.getSqlQuery(mp)
 	if err != nil {
 		return "", nil, err
 	}
-	if err := json.Unmarshal(body, &vec); err != nil {
+	if err := json.Unmarshal(data, &vec); err != nil {
 		return "", nil, err
 	}
 	return qr, vec, nil
